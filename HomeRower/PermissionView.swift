@@ -82,6 +82,26 @@ struct PermissionView: View {
                 Text("Resetting HomeRower's permission…")
             }
             .foregroundStyle(.secondary)
+        } else if eventTap.needsManualRetry {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("HomeRower stopped to keep your keyboard working.", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("macOS stopped accepting HomeRower's key events, which happens when HomeRower is removed from the list. Make sure HomeRower is in the list and turned on, then click Try Again.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Try Again") {
+                        eventTap.retryAfterFailSafe()
+                    }
+                    Button("Reset Permission") {
+                        Task { await eventTap.resetPermission() }
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
         } else if eventTap.isTapBlocked {
             VStack(alignment: .leading, spacing: 8) {
                 Label("HomeRower is turned on, but macOS isn't letting it start.", systemImage: "exclamationmark.triangle.fill")
