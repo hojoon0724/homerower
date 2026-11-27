@@ -79,7 +79,7 @@ nonisolated enum Config {
     /// Tag written into `.eventSourceUserData` of every event we post, so the tap can ignore them.
     static let syntheticEventTag: Int64 = 0x484D52
 
-    /// Physical home-row key → modifier when held.
+    /// Default key map: physical home-row key → modifier when held. The user can change it.
     static let homeRowMods: [UInt16: Modifier] = [
         KeyCode.a: .leftShift,
         KeyCode.s: .leftControl,

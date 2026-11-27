@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// The main window: status, permissions, timings, key map and a place to try typing.
+/// The settings shown in the main window once HomeRower is running: status, timings,
+/// key map and a place to try typing.
 struct MainView: View {
     @Bindable var eventTap: EventTap
     @Environment(\.openWindow) private var openWindow
@@ -8,71 +9,67 @@ struct MainView: View {
 
     var body: some View {
         Form {
-            statusSection
-            if eventTap.status != .running {
-                permissionSection
-            }
             timingSection
             keyMapSection
             testSection
+            logSection
         }
         .formStyle(.grouped)
-        .frame(minWidth: 460, minHeight: 560)
+        .frame(width: 560)
+        .frame(minHeight: 600, maxHeight: .infinity)
         .toolbar {
-            Button("Show Log", systemImage: "list.bullet.rectangle") {
-                openWindow(id: "log")
+            // Status and the on/off switch
+            ToolbarItem {
+                ZStack(alignment: .trailing) {
+                    statusControl(isOn: .constant(true)).hidden()
+                    statusControl(isOn: $eventTap.isEnabled)
+                }
+                // Keep it away from the window's right edge.
+                .padding(.trailing, 18)
             }
+            .sharedBackgroundVisibility(.hidden)
         }
-        // Show a Dock icon only while this window is open.
-        .onAppear {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate()
+    }
+
+    /// status dot and text + on/off switch.
+    private func statusControl(isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 8, height: 8)
+                ZStack(alignment: .leading) {
+                    ForEach(Self.statusTextsShownHere, id: \.self) { text in
+                        Text(text).hidden()
+                    }
+                    Text(statusText)
+                        .foregroundStyle(statusColor)
+                }
+                .font(.subheadline)
+            }
+            Toggle("Home-row mods enabled", isOn: isOn)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+                .fixedSize()
         }
-        .onDisappear {
-            NSApp.setActivationPolicy(.accessory)
-        }
+        .fixedSize()
+        .help("Home-row mods enabled")
     }
 
     // MARK: - Sections
 
-    private var statusSection: some View {
-        Section {
-            LabeledContent("Status") {
-                Label(statusText, systemImage: "circle.fill")
-                    .foregroundStyle(statusColor)
-            }
-            Toggle("Home-row mods enabled", isOn: $eventTap.isEnabled)
-                .disabled(eventTap.status != .running)
-        }
-    }
-
-    private var permissionSection: some View {
-        Section("Permissions") {
-            Text("HomeRower needs **Input Monitoring** and **Accessibility** access to read and send key events. Turn HomeRower on in Privacy & Security, then click Retry.")
-                .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Button("Open Privacy Settings…") {
-                    eventTap.openPrivacySettings()
-                }
-                Button("Retry") {
-                    eventTap.start()
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-    }
-
     private var timingSection: some View {
         Section {
             TimingRow(
-                title: "Tapping term",
-                detail: "A home-row key held longer than this becomes a modifier.",
+                title: "Hold threshold",
+                detail: "How long to hold a home-row key before it acts as a modifier. Raise it if you rest on keys while typing and get modifiers instead of letters.",
                 value: $eventTap.tappingTermMs,
                 range: 100...500
             )
             TimingRow(
-                title: "Typing-speed rule",
-                detail: "A home-row key pressed this soon after another key is always a letter. 0 turns it off.",
+                title: "Fast-typing window",
+                detail: "A home-row key pressed this soon after the previous key is treated as a letter, whatever order you release the keys in; it only becomes a modifier if held for the full hold threshold. Raise it if you get stray capitals or shortcuts while typing fast. 0 turns it off.",
                 value: $eventTap.priorIdleMs,
                 range: 0...300
             )
@@ -90,23 +87,17 @@ struct MainView: View {
     }
 
     private var keyMapSection: some View {
-        Section("Key Map") {
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
-                GridRow {
-                    Text("Key").fontWeight(.semibold)
-                    Text("Tap").fontWeight(.semibold)
-                    Text("Hold").fontWeight(.semibold)
+        Section {
+            KeyboardView(eventTap: eventTap)
+        } header: {
+            HStack {
+                Text("Key Map")
+                Spacer()
+                Button("Reset to Defaults") {
+                    eventTap.resetKeyMapToDefaults()
                 }
-                .foregroundStyle(.secondary)
-                ForEach(KeyMapEntry.all) { entry in
-                    GridRow {
-                        Text(entry.physical)
-                            .font(.system(.body, design: .monospaced))
-                        Text(entry.tap)
-                            .font(.system(.body, design: .monospaced))
-                        Text(entry.hold)
-                    }
-                }
+                .buttonStyle(.link)
+                .font(.callout)
             }
         }
     }
@@ -123,68 +114,88 @@ struct MainView: View {
         }
     }
 
+    private var logSection: some View {
+        Section {
+            Button("Show Log", systemImage: "list.bullet.rectangle") {
+                openWindow(id: "log")
+            }
+        }
+    }
+
     // MARK: - Status
 
+    /// The statuses this view can show. It's only on screen while the tap is running;
+    /// the permission screen covers the other states.
+    private static let statusTextsShownHere = ["Running", "Stopped"]
+
+    /// "Stopped" means switched off; the tap not running yet is a separate state.
     private var statusText: String {
         switch eventTap.status {
-        case .running: eventTap.isEnabled ? "Running" : "Paused"
+        case .running: eventTap.isEnabled ? "Running" : "Stopped"
         case .waitingForPermission: "Waiting for permission"
-        case .stopped: "Stopped"
+        case .stopped: "Starting…"
         }
     }
 
     private var statusColor: Color {
         switch eventTap.status {
-        case .running: eventTap.isEnabled ? .green : .yellow
-        case .waitingForPermission: .orange
-        case .stopped: .red
+        case .running: eventTap.isEnabled ? .green : .red
+        case .waitingForPermission, .stopped: .orange
         }
     }
 }
 
-/// A slider plus a numeric field for a millisecond value.
+#Preview {
+    MainView(eventTap: EventTap())
+        .frame(width: 560, height: 820)
+}
+
+/// A name with an info tooltip, and a slider for a millisecond value.
 private struct TimingRow: View {
     let title: String
     let detail: String
     @Binding var value: Double
     let range: ClosedRange<Double>
 
+    /// The slider is being dragged; the value shows only then.
+    @State private var isDragging = false
+
+    /// The pointer is over the info icon; its description shows only then.
+    @State private var isShowingInfo = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title)
-                Spacer()
-                TextField(title, value: $value, format: .number.precision(.fractionLength(0)))
-                    .labelsHidden()
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 56)
-                    .onSubmit { value = min(max(value, range.lowerBound), range.upperBound) }
-                Text("ms")
-                    .foregroundStyle(.secondary)
-            }
-            Slider(value: $value, in: range, step: 5)
-            Text(detail)
-                .font(.caption)
+        HStack {
+            Text(title)
+            // The description shows as soon as the pointer is over the icon. A `.help`
+            // tooltip waits for the system's hover delay, so this uses a popover instead.
+            Image(systemName: "info.circle")
                 .foregroundStyle(.secondary)
+                .onHover { isShowingInfo = $0 }
+                .popover(isPresented: $isShowingInfo, arrowEdge: .bottom) {
+                    Text(detail)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(width: 280, alignment: .leading)
+                        .padding(12)
+                }
+                .accessibilityLabel("About \(title)")
+                .accessibilityValue(detail)
+            Spacer()
+            // The value, left of the slider, only while dragging. It's faded out rather
+            // than removed, so nothing shifts when it appears.
+            Text("\(Int(value)) ms")
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .opacity(isDragging ? 1 : 0)
+                .accessibilityHidden(true)
+            Slider(value: $value, in: range) { editing in
+                isDragging = editing
+            }
+            .labelsHidden()
+            .frame(width: 260)
+            .accessibilityValue("\(Int(value)) milliseconds")
         }
+        .padding(.top, 2)
+        .padding(.trailing,4)
     }
-}
-
-/// One row of the key map table (from plan.md).
-private struct KeyMapEntry: Identifiable {
-    let physical: String
-    let tap: String
-    let hold: String
-    var id: String { physical }
-
-    static let all: [KeyMapEntry] = [
-        KeyMapEntry(physical: "A", tap: "a", hold: "Left Shift"),
-        KeyMapEntry(physical: "S", tap: "o", hold: "Left Control"),
-        KeyMapEntry(physical: "D", tap: "e", hold: "Left Option"),
-        KeyMapEntry(physical: "F", tap: "u", hold: "Left Command"),
-        KeyMapEntry(physical: "J", tap: "h", hold: "Right Command"),
-        KeyMapEntry(physical: "K", tap: "t", hold: "Right Option"),
-        KeyMapEntry(physical: "L", tap: "n", hold: "Right Control"),
-        KeyMapEntry(physical: ";", tap: "s", hold: "Right Shift"),
-    ]
 }

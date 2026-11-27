@@ -71,7 +71,7 @@ struct HoldTapEngineTests {
         #expect(h.actions == [.modifier(.leftShift, down: true), .modifier(.leftShift, down: false)])
     }
 
-    @Test func opposideHandRollTypesBothLetters() {
+    @Test func oppositeHandRollTypesBothLetters() {
         // A↓ J↓ A↑ J↑ → "ah"
         var h = Harness()
         h.down(KeyCode.a, at: t0)
@@ -108,7 +108,8 @@ struct HoldTapEngineTests {
         h.down(KeyCode.s, at: t0 + 0.050)
         h.up(KeyCode.s, at: t0 + 0.100)
         h.up(KeyCode.a, at: t0 + 0.150)
-        #expect(h.actions == [press(KeyCode.a)] + tap(KeyCode.s) + [release(KeyCode.a)])
+        // A's physical key up flows through as a normal event.
+        #expect(h.actions == [press(KeyCode.a)] + tap(KeyCode.s) + [.passThrough])
     }
 
     @Test func sameHandRollReleasedInOrder() {
@@ -132,8 +133,9 @@ struct HoldTapEngineTests {
         #expect(h.actions == [press(KeyCode.a), press(KeyCode.e), .passThrough, .passThrough])
     }
 
-    @Test func typingSpeedRuleTapsImmediately() {
-        // X↓ X↑, then A↓ within 150 ms, J↓ J↑ A↑ → "xah", no modifiers, all passed through.
+    @Test func typingSpeedRuleTapsOnNextKey() {
+        // X↓ X↑, then A↓ within 150 ms, J↓ J↑ A↑ → "xah": during fast typing the next
+        // key press makes A a letter, even though J is released inside A (no permissive hold).
         var h = Harness()
         h.down(KeyCode.x, at: t0)
         h.up(KeyCode.x, at: t0 + 0.050)
@@ -141,8 +143,43 @@ struct HoldTapEngineTests {
         h.down(KeyCode.j, at: t0 + 0.150)
         h.up(KeyCode.j, at: t0 + 0.200)
         h.up(KeyCode.a, at: t0 + 0.250)
-        #expect(h.actions == Array(repeating: .passThrough, count: 6))
-        #expect(h.timers.isEmpty)
+        #expect(h.actions == [.passThrough, .passThrough, press(KeyCode.a)] + tap(KeyCode.j) + [.passThrough])
+    }
+
+    @Test func holdRightAfterAnotherKeyIsStillModifier() {
+        // H↓ H↑, A↓ right after and held → Shift, then T gives Shift+T.
+        var h = Harness()
+        h.down(KeyCode.h, at: t0)
+        h.up(KeyCode.h, at: t0 + 0.050)
+        h.down(KeyCode.a, at: t0 + 0.080)
+        h.advance(to: t0 + 0.350)
+        h.down(KeyCode.t, at: t0 + 0.400)
+        h.up(KeyCode.t, at: t0 + 0.450)
+        h.up(KeyCode.a, at: t0 + 0.500)
+        #expect(h.actions == [
+            .passThrough,
+            .passThrough,
+            .modifier(.leftShift, down: true),
+            .passThrough,
+            .passThrough,
+            .modifier(.leftShift, down: false),
+        ])
+    }
+
+    @Test func holdWhilePreviousKeyStillDownIsStillModifier() {
+        // H↓, A↓ before H is released, H↑, A held → Shift.
+        var h = Harness()
+        h.down(KeyCode.h, at: t0)
+        h.down(KeyCode.a, at: t0 + 0.050)
+        h.up(KeyCode.h, at: t0 + 0.100)
+        h.advance(to: t0 + 0.300)
+        h.up(KeyCode.a, at: t0 + 0.400)
+        #expect(h.actions == [
+            .passThrough,
+            .modifier(.leftShift, down: true),
+            release(KeyCode.h),
+            .modifier(.leftShift, down: false),
+        ])
     }
 
     @Test func stackedModifiersCommandShiftQ() {
@@ -171,6 +208,22 @@ struct HoldTapEngineTests {
         h.up(KeyCode.j, at: t0 + 0.300)
         h.up(KeyCode.f, at: t0 + 0.350)
         #expect(h.actions == [.modifier(.leftCommand, down: true)] + tap(KeyCode.j) + [.modifier(.leftCommand, down: false)])
+    }
+
+    @Test func customKeyMapIsUsed() {
+        // G mapped to Command, A unmapped: A passes straight through, G holds Command.
+        var h = Harness(engine: HoldTapEngine(settings: .init(keyMap: [KeyCode.g: .leftCommand])))
+        h.down(KeyCode.a, at: t0)
+        h.up(KeyCode.a, at: t0 + 0.050)
+        h.down(KeyCode.g, at: t0 + 1)
+        h.advance(to: t0 + 1.250)
+        h.up(KeyCode.g, at: t0 + 1.300)
+        #expect(h.actions == [
+            .passThrough,
+            .passThrough,
+            .modifier(.leftCommand, down: true),
+            .modifier(.leftCommand, down: false),
+        ])
     }
 
     @Test func resetReleasesHeldModifiers() {

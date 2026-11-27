@@ -28,6 +28,8 @@ nonisolated struct HoldTapEngine {
     struct Settings: Sendable {
         var tappingTerm: TimeInterval = Config.tappingTerm
         var priorIdle: TimeInterval = Config.priorIdle
+        /// Physical key → modifier when held.
+        var keyMap: [UInt16: Modifier] = Config.homeRowMods
     }
 
     private struct Pending {
@@ -35,13 +37,21 @@ nonisolated struct HoldTapEngine {
         var modifier: Modifier
         var downTime: TimeInterval
         var token: Int
+        /// Pressed during fast typing (typing-speed rule): only a timeout can make it a hold.
+        var isFastTyping: Bool
+    }
+
+    /// An event plus whether it arrived during fast typing, decided when it arrived.
+    private struct Buffered {
+        var event: KeyEvent
+        var isFastTyping: Bool
     }
 
     var settings: Settings
 
     private var pending: Pending?
     /// Events swallowed while `pending` is undecided, in arrival order.
-    private var buffer: [KeyEvent] = []
+    private var buffer: [Buffered] = []
     /// Physical key → modifier it is currently holding down.
     private var heldModifiers: [UInt16: Modifier] = [:]
     /// Time of the last live key event (typing-speed rule).
@@ -61,7 +71,12 @@ nonisolated struct HoldTapEngine {
     /// Handles a live key event from the keyboard.
     mutating func handle(_ event: KeyEvent) -> [EngineAction] {
         output = []
-        process(event, now: event.timestamp, isLive: true)
+        // Typing-speed rule: pressed right after another key, with no modifier held.
+        var isFastTyping = false
+        if heldModifiers.isEmpty, let lastEventTime {
+            isFastTyping = event.timestamp - lastEventTime < settings.priorIdle
+        }
+        process(Buffered(event: event, isFastTyping: isFastTyping), now: event.timestamp)
         lastEventTime = event.timestamp
 
         // If the only result is the event itself, pass the original through instead of
@@ -93,7 +108,9 @@ nonisolated struct HoldTapEngine {
 
     // MARK: - Processing
 
-    private mutating func process(_ event: KeyEvent, now: TimeInterval, isLive: Bool) {
+    private mutating func process(_ item: Buffered, now: TimeInterval) {
+        let event = item.event
+
         // The tapping term may have run out before this event happened, even if the
         // timer hasn't fired yet (or the event is being replayed). Decide that first.
         if let pending, event.timestamp >= pending.downTime + settings.tappingTerm {
@@ -101,7 +118,7 @@ nonisolated struct HoldTapEngine {
         }
 
         if pending != nil {
-            processWhilePending(event, now: now)
+            processWhilePending(item, now: now)
             return
         }
 
@@ -111,14 +128,14 @@ nonisolated struct HoldTapEngine {
                 if heldModifiers[event.keyCode] == nil { emit(event) }
                 return
             }
-            if let modifier = Config.homeRowMods[event.keyCode], heldModifiers[event.keyCode] == nil {
-                // Typing-speed rule: pressed right after another key while typing → tap.
-                if isLive, heldModifiers.isEmpty, let lastEventTime,
-                   event.timestamp - lastEventTime < settings.priorIdle {
-                    emit(event)
-                    return
-                }
-                startPending(keyCode: event.keyCode, modifier: modifier, downTime: event.timestamp, now: now)
+            if let modifier = settings.keyMap[event.keyCode], heldModifiers[event.keyCode] == nil {
+                startPending(
+                    keyCode: event.keyCode,
+                    modifier: modifier,
+                    downTime: event.timestamp,
+                    isFastTyping: item.isFastTyping,
+                    now: now
+                )
                 return
             }
             emit(event)
@@ -131,8 +148,9 @@ nonisolated struct HoldTapEngine {
         }
     }
 
-    private mutating func processWhilePending(_ event: KeyEvent, now: TimeInterval) {
+    private mutating func processWhilePending(_ item: Buffered, now: TimeInterval) {
         guard let pending else { return }
+        let event = item.event
 
         if event.keyCode == pending.keyCode {
             // Autorepeat of the pending key: swallow.
@@ -146,53 +164,68 @@ nonisolated struct HoldTapEngine {
         }
 
         if event.isRepeat {
-            buffer.append(event)
+            buffer.append(item)
+            return
+        }
+
+        // Fast typing: the next key press means this was a letter in a roll. Only
+        // holding past the tapping term (the timeout) makes it a modifier.
+        if pending.isFastTyping && event.isDown {
+            resolveTap(trigger: item, now: now)
             return
         }
 
         let sameHand = isSameHand(event.keyCode, pending.keyCode)
-        let isHomeRowMod = Config.homeRowMods[event.keyCode] != nil
+        let isHomeRowMod = settings.keyMap[event.keyCode] != nil
 
         if event.isDown {
             // Opposite-hand rule: a same-hand key means we're typing, not chording.
             // Home-row mods on the same hand are exempt so they can stack (e.g. F+A → Cmd+Shift).
             if sameHand && !isHomeRowMod {
-                resolveTap(trigger: event, now: now)
+                resolveTap(trigger: item, now: now)
             } else {
-                buffer.append(event)
+                buffer.append(item)
             }
             return
         }
 
         // A key that was pressed *and* released while pending.
-        let pressedWhilePending = buffer.contains { $0.keyCode == event.keyCode && $0.isDown && !$0.isRepeat }
+        let pressedWhilePending = buffer.contains {
+            $0.event.keyCode == event.keyCode && $0.event.isDown && !$0.event.isRepeat
+        }
         if pressedWhilePending {
             if sameHand && isHomeRowMod {
                 // Same-hand roll across two home-row keys (e.g. "ue") → tap.
-                resolveTap(trigger: event, now: now)
+                resolveTap(trigger: item, now: now)
             } else {
                 // Permissive hold.
-                resolveHold(trigger: event, now: now)
+                resolveHold(trigger: item, now: now)
             }
             return
         }
 
-        buffer.append(event)
+        buffer.append(item)
     }
 
     // MARK: - Resolution
 
-    private mutating func startPending(keyCode: UInt16, modifier: Modifier, downTime: TimeInterval, now: TimeInterval) {
+    private mutating func startPending(
+        keyCode: UInt16,
+        modifier: Modifier,
+        downTime: TimeInterval,
+        isFastTyping: Bool,
+        now: TimeInterval
+    ) {
         let token = nextToken
         nextToken += 1
-        pending = Pending(keyCode: keyCode, modifier: modifier, downTime: downTime, token: token)
+        pending = Pending(keyCode: keyCode, modifier: modifier, downTime: downTime, token: token, isFastTyping: isFastTyping)
         let remaining = max(0, settings.tappingTerm - (now - downTime))
         output.append(.startTimer(token: token, delay: remaining))
     }
 
     /// Resolves the pending key as a tap. Only its key down is sent; the physical key up
     /// later flows through as a normal event.
-    private mutating func resolveTap(trigger: KeyEvent, now: TimeInterval) {
+    private mutating func resolveTap(trigger: Buffered, now: TimeInterval) {
         guard let pending else { return }
         self.pending = nil
         output.append(.key(pending.keyCode, down: true))
@@ -201,7 +234,7 @@ nonisolated struct HoldTapEngine {
     }
 
     /// Resolves the pending key as a hold: its modifier stays down until the key goes up.
-    private mutating func resolveHold(trigger: KeyEvent?, now: TimeInterval) {
+    private mutating func resolveHold(trigger: Buffered?, now: TimeInterval) {
         guard let pending else { return }
         self.pending = nil
         heldModifiers[pending.keyCode] = pending.modifier
@@ -213,10 +246,10 @@ nonisolated struct HoldTapEngine {
     /// Feeds buffered events back through the handler, so a home-row key in the buffer
     /// can become pending itself (this is what makes modifiers stack).
     private mutating func replayBuffer(now: TimeInterval) {
-        let events = buffer
+        let items = buffer
         buffer = []
-        for event in events {
-            process(event, now: now, isLive: false)
+        for item in items {
+            process(item, now: now)
         }
     }
 

@@ -13,11 +13,9 @@ struct MenuContentView: View {
             Text("Event tap running")
         case .waitingForPermission:
             Text("Waiting for permission")
-            Button("Open Privacy Settings…") {
-                eventTap.openPrivacySettings()
-            }
-            Button("Retry") {
-                eventTap.start()
+            Button("Set Up Permission…") {
+                openWindow(id: "main")
+                NSApp.activate()
             }
         case .stopped:
             Text("Stopped")
@@ -28,6 +26,10 @@ struct MenuContentView: View {
 
         Divider()
 
+        Button("Open HomeRower…") {
+            openWindow(id: "main")
+            NSApp.activate()
+        }
         Toggle("Log Key Events", isOn: $eventTap.logsKeyEvents)
         Button("Show Log") {
             openWindow(id: "log")
