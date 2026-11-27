@@ -24,3 +24,22 @@ struct LogView: View {
         }
     }
 }
+
+#Preview("With Lines") {
+    LogView(eventTap: .preview(logLines: [
+        "Status: stopped → running",
+        "Event tap running. Accessibility=true PostEvent=true InputMonitoring=true tap=enabled status=running",
+        "↓ key 3  t=1024.512",
+        "Hold leftCommand",
+        "↓ key 12  t=1024.733",
+        "↑ key 12  t=1024.801",
+        "↑ key 3  t=1024.902",
+        "Release leftCommand",
+    ]))
+    .frame(width: 420, height: 480)
+}
+
+#Preview("Empty") {
+    LogView(eventTap: .preview())
+        .frame(width: 420, height: 480)
+}

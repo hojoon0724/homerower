@@ -7,6 +7,10 @@ struct MainView: View {
     @Bindable var launchSettings: LaunchSettings
     @Environment(\.openWindow) private var openWindow
     @State private var testText = ""
+    @State private var isSavingLayout = false
+    @State private var isManagingLayouts = false
+    /// Save Custom… was chosen in the replace alert.
+    @State private var isSavingCustom = false
 
     var body: some View {
         Form {
@@ -17,6 +21,25 @@ struct MainView: View {
             logSection
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $isSavingLayout) {
+            SaveLayoutSheet(eventTap: eventTap)
+        }
+        .sheet(isPresented: $isManagingLayouts) {
+            ManageLayoutsSheet(eventTap: eventTap)
+        }
+        .sheet(isPresented: $isSavingCustom, onDismiss: {
+            // Cancelled without saving: the edit doesn't happen.
+            eventTap.cancelPendingEdit()
+        }) {
+            SaveLayoutSheet(eventTap: eventTap, source: .customBeforeEdit)
+        }
+        .alert("Replace your Custom layout?", isPresented: isConfirmingReplace) {
+            Button("Save Custom…") { isSavingCustom = true }
+            Button("Replace", role: .destructive) { eventTap.confirmPendingEdit() }
+            Button("Cancel", role: .cancel) { eventTap.cancelPendingEdit() }
+        } message: {
+            Text("Your Custom layout has unsaved changes. Editing “\(eventTap.name(of: eventTap.layoutSelection))” will replace them.")
+        }
         .frame(width: 560)
         .frame(minHeight: 600, maxHeight: .infinity)
         .toolbar {
@@ -103,31 +126,75 @@ struct MainView: View {
                 range: 0...300
             )
         } header: {
-            HStack {
-                Text("Timing")
-                Spacer()
-                Button("Reset to Defaults") {
-                    eventTap.resetTimingsToDefaults()
-                }
-                .buttonStyle(.link)
-                .font(.callout)
-            }
+            sectionHeader("Timing", reset: eventTap.resetTimingsToDefaults)
         }
     }
 
     private var keyMapSection: some View {
-        Section {
-            KeyboardView(eventTap: eventTap)
-        } header: {
-            HStack {
-                Text("Key Map")
-                Spacer()
-                Button("Reset to Defaults") {
-                    eventTap.resetKeyMapToDefaults()
+        Section("Key Map") {
+            Picker("Layout", selection: layoutChoice) {
+                ForEach(LayoutPreset.allCases) { preset in
+                    Text(preset.displayName).tag(LayoutChoice.layout(.preset(preset)))
                 }
+                if !eventTap.savedLayouts.isEmpty {
+                    Divider()
+                    ForEach(eventTap.savedLayouts) { saved in
+                        Text(saved.name).tag(LayoutChoice.layout(.saved(saved.id)))
+                    }
+                }
+                // Unsaved edits: appears with the first edit and stays until saved or discarded.
+                if eventTap.customLayout != nil {
+                    Divider()
+                    Text("Custom").tag(LayoutChoice.layout(.custom))
+                }
+                // Actions, not layouts: picking one opens a sheet and leaves the layout alone.
+                Divider()
+                Text("Save Layout…").tag(LayoutChoice.saveLayout)
+                Text("Manage Layouts…").tag(LayoutChoice.manageLayouts)
+            }
+            KeyboardView(eventTap: eventTap)
+        }
+    }
+
+    /// Shows the replace alert while an edit waits for the user, unless they're saving Custom.
+    /// The alert's buttons decide what happens to the edit, so dismissing does nothing more.
+    private var isConfirmingReplace: Binding<Bool> {
+        Binding(
+            get: { eventTap.pendingEdit != nil && !isSavingCustom },
+            set: { _ in }
+        )
+    }
+
+    /// An entry in the Layout picker.
+    private enum LayoutChoice: Hashable {
+        case layout(LayoutSelection)
+        case saveLayout
+        case manageLayouts
+    }
+
+    /// The layout in use; picking another switches to it. The selection never becomes an
+    /// action, so the picker keeps showing the real layout.
+    private var layoutChoice: Binding<LayoutChoice> {
+        Binding(
+            get: { .layout(eventTap.layoutSelection) },
+            set: { choice in
+                switch choice {
+                case .layout(let selection): eventTap.select(selection)
+                case .saveLayout: isSavingLayout = true
+                case .manageLayouts: isManagingLayouts = true
+                }
+            }
+        )
+    }
+
+    /// A section title with a Reset to Defaults link on the right.
+    private func sectionHeader(_ title: LocalizedStringKey, reset: @escaping () -> Void) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Button("Reset to Defaults", action: reset)
                 .buttonStyle(.link)
                 .font(.callout)
-            }
         }
     }
 
@@ -146,7 +213,7 @@ struct MainView: View {
     private var logSection: some View {
         Section {
             Button("Show Log", systemImage: "list.bullet.rectangle") {
-                openWindow(id: "log")
+                openWindow.bringToFront(.log)
             }
         }
     }
@@ -174,57 +241,12 @@ struct MainView: View {
     }
 }
 
-#Preview {
-    MainView(eventTap: EventTap(), launchSettings: LaunchSettings())
+#Preview("Enabled") {
+    MainView(eventTap: .preview(), launchSettings: .preview())
         .frame(width: 560, height: 820)
 }
 
-/// A name with an info tooltip, and a slider for a millisecond value.
-private struct TimingRow: View {
-    let title: String
-    let detail: String
-    @Binding var value: Double
-    let range: ClosedRange<Double>
-
-    /// The slider is being dragged; the value shows only then.
-    @State private var isDragging = false
-
-    /// The pointer is over the info icon; its description shows only then.
-    @State private var isShowingInfo = false
-
-    var body: some View {
-        HStack {
-            Text(title)
-            // The description shows as soon as the pointer is over the icon. A `.help`
-            // tooltip waits for the system's hover delay, so this uses a popover instead.
-            Image(systemName: "info.circle")
-                .foregroundStyle(.secondary)
-                .onHover { isShowingInfo = $0 }
-                .popover(isPresented: $isShowingInfo, arrowEdge: .bottom) {
-                    Text(detail)
-                        .font(.callout)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(width: 280, alignment: .leading)
-                        .padding(12)
-                }
-                .accessibilityLabel("About \(title)")
-                .accessibilityValue(detail)
-            Spacer()
-            // The value, left of the slider, only while dragging. It's faded out rather
-            // than removed, so nothing shifts when it appears.
-            Text("\(Int(value)) ms")
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .opacity(isDragging ? 1 : 0)
-                .accessibilityHidden(true)
-            Slider(value: $value, in: range) { editing in
-                isDragging = editing
-            }
-            .labelsHidden()
-            .frame(width: 260)
-            .accessibilityValue("\(Int(value)) milliseconds")
-        }
-        .padding(.top, 2)
-        .padding(.trailing,4)
-    }
+#Preview("Disabled") {
+    MainView(eventTap: .preview(isEnabled: false), launchSettings: .preview())
+        .frame(width: 560, height: 820)
 }

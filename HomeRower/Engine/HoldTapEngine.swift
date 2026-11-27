@@ -29,12 +29,17 @@ nonisolated struct HoldTapEngine {
         var tappingTerm: TimeInterval = Config.tappingTerm
         var priorIdle: TimeInterval = Config.priorIdle
         /// Physical key → modifier when held.
-        var keyMap: [UInt16: Modifier] = Config.homeRowMods
+        var keyMap: [UInt16: ModifierSet] = Config.homeRowMods
+        /// Shift keys are decided only by which key goes up first (or the tapping term),
+        /// never by the next key going down. Capitals are typed fast and often with a
+        /// same-hand letter, which the typing-speed and opposite-hand rules would turn
+        /// into two letters.
+        var shiftDecidedByRelease = Config.shiftDecidedByRelease
     }
 
     private struct Pending {
         var keyCode: UInt16
-        var modifier: Modifier
+        var modifiers: ModifierSet
         var downTime: TimeInterval
         var token: Int
         /// Pressed during fast typing (typing-speed rule): only a timeout can make it a hold.
@@ -53,7 +58,7 @@ nonisolated struct HoldTapEngine {
     /// Events swallowed while `pending` is undecided, in arrival order.
     private var buffer: [Buffered] = []
     /// Physical key → modifier it is currently holding down.
-    private var heldModifiers: [UInt16: Modifier] = [:]
+    private var heldModifiers: [UInt16: ModifierSet] = [:]
     /// Time of the last live key event (typing-speed rule).
     private var lastEventTime: TimeInterval?
     private var nextToken = 0
@@ -64,7 +69,10 @@ nonisolated struct HoldTapEngine {
     }
 
     /// Modifiers currently held by home-row keys.
-    var activeModifiers: Set<Modifier> { Set(heldModifiers.values) }
+    var activeModifiers: Set<Modifier> { Set(heldModifiers.values.flatMap(\.modifiers)) }
+
+    /// Home-row keys currently held as their modifier.
+    var heldKeys: Set<UInt16> { Set(heldModifiers.keys) }
 
     // MARK: - Inputs
 
@@ -72,8 +80,12 @@ nonisolated struct HoldTapEngine {
     mutating func handle(_ event: KeyEvent) -> [EngineAction] {
         output = []
         // Typing-speed rule: pressed right after another key, with no modifier held.
+        // A key pressed while another home-row key is pending is part of the same
+        // chord (e.g. F then D for Cmd+Opt), so it inherits that key's verdict instead.
         var isFastTyping = false
-        if heldModifiers.isEmpty, let lastEventTime {
+        if let pending {
+            isFastTyping = pending.isFastTyping
+        } else if heldModifiers.isEmpty, let lastEventTime {
             isFastTyping = event.timestamp - lastEventTime < settings.priorIdle
         }
         process(Buffered(event: event, isFastTyping: isFastTyping), now: event.timestamp)
@@ -98,7 +110,7 @@ nonisolated struct HoldTapEngine {
 
     /// Drops all state and releases any held modifiers (used when disabling the app).
     mutating func reset() -> [EngineAction] {
-        let releases = heldModifiers.values.map { EngineAction.modifier($0, down: false) }
+        let releases = heldModifiers.values.flatMap(Self.release)
         pending = nil
         buffer = []
         heldModifiers = [:]
@@ -128,10 +140,10 @@ nonisolated struct HoldTapEngine {
                 if heldModifiers[event.keyCode] == nil { emit(event) }
                 return
             }
-            if let modifier = settings.keyMap[event.keyCode], heldModifiers[event.keyCode] == nil {
+            if let modifiers = settings.keyMap[event.keyCode], !modifiers.isEmpty, heldModifiers[event.keyCode] == nil {
                 startPending(
                     keyCode: event.keyCode,
-                    modifier: modifier,
+                    modifiers: modifiers,
                     downTime: event.timestamp,
                     isFastTyping: item.isFastTyping,
                     now: now
@@ -140,8 +152,8 @@ nonisolated struct HoldTapEngine {
             }
             emit(event)
         } else {
-            if let modifier = heldModifiers.removeValue(forKey: event.keyCode) {
-                output.append(.modifier(modifier, down: false))
+            if let modifiers = heldModifiers.removeValue(forKey: event.keyCode) {
+                output += Self.release(modifiers)
                 return
             }
             emit(event)
@@ -163,14 +175,33 @@ nonisolated struct HoldTapEngine {
             return
         }
 
+        let pressedWhilePending = buffer.contains {
+            $0.event.keyCode == event.keyCode && $0.event.isDown && !$0.event.isRepeat
+        }
+
+        // A key that went down before the pending one: its press is already out, so its
+        // repeats and release can't change the decision. Send them now; holding the release
+        // back keeps the key down too long (e.g. it opens the accent popup once the
+        // modifier lands).
+        if !pressedWhilePending && (event.isRepeat || !event.isDown) {
+            passEarlierKey(event)
+            return
+        }
+
         if event.isRepeat {
             buffer.append(item)
             return
         }
 
+        // Shift, and keys outside the letter block (Caps Lock), aren't typed in rolls:
+        // only releases (and the timeout) decide, so skip the rules that decide on a key
+        // going down.
+        let decidedByRelease = (settings.shiftDecidedByRelease && pending.modifiers.isShiftOnly)
+            || Config.hand(of: pending.keyCode) == nil
+
         // Fast typing: the next key press means this was a letter in a roll. Only
         // holding past the tapping term (the timeout) makes it a modifier.
-        if pending.isFastTyping && event.isDown {
+        if pending.isFastTyping && event.isDown && !decidedByRelease {
             resolveTap(trigger: item, now: now)
             return
         }
@@ -181,7 +212,9 @@ nonisolated struct HoldTapEngine {
         if event.isDown {
             // Opposite-hand rule: a same-hand key means we're typing, not chording.
             // Home-row mods on the same hand are exempt so they can stack (e.g. F+A → Cmd+Shift).
-            if sameHand && !isHomeRowMod {
+            // If the chord already spans both hands (e.g. F+K), every key is on the same hand
+            // as one of its mods, so don't treat that as typing.
+            if sameHand && !isHomeRowMod && !chordHasModifier(oppositeTo: event.keyCode) && !decidedByRelease {
                 resolveTap(trigger: item, now: now)
             } else {
                 buffer.append(item)
@@ -189,36 +222,41 @@ nonisolated struct HoldTapEngine {
             return
         }
 
-        // A key that was pressed *and* released while pending.
-        let pressedWhilePending = buffer.contains {
-            $0.event.keyCode == event.keyCode && $0.event.isDown && !$0.event.isRepeat
+        // Released here, so it was pressed *and* released while pending.
+        if sameHand && isHomeRowMod && !decidedByRelease {
+            // Same-hand roll across two home-row keys (e.g. "ue") → tap.
+            resolveTap(trigger: item, now: now)
+        } else {
+            // Permissive hold.
+            resolveHold(trigger: item, now: now)
         }
-        if pressedWhilePending {
-            if sameHand && isHomeRowMod {
-                // Same-hand roll across two home-row keys (e.g. "ue") → tap.
-                resolveTap(trigger: item, now: now)
-            } else {
-                // Permissive hold.
-                resolveHold(trigger: item, now: now)
-            }
+    }
+
+    /// Handles a repeat or release of a key pressed before the pending key, as if nothing
+    /// were pending: a held modifier is released, anything else goes straight out.
+    private mutating func passEarlierKey(_ event: KeyEvent) {
+        if let modifiers = heldModifiers[event.keyCode] {
+            // Autorepeat of a key acting as a modifier is swallowed.
+            guard !event.isDown else { return }
+            heldModifiers[event.keyCode] = nil
+            output += Self.release(modifiers)
             return
         }
-
-        buffer.append(item)
+        emit(event)
     }
 
     // MARK: - Resolution
 
     private mutating func startPending(
         keyCode: UInt16,
-        modifier: Modifier,
+        modifiers: ModifierSet,
         downTime: TimeInterval,
         isFastTyping: Bool,
         now: TimeInterval
     ) {
         let token = nextToken
         nextToken += 1
-        pending = Pending(keyCode: keyCode, modifier: modifier, downTime: downTime, token: token, isFastTyping: isFastTyping)
+        pending = Pending(keyCode: keyCode, modifiers: modifiers, downTime: downTime, token: token, isFastTyping: isFastTyping)
         let remaining = max(0, settings.tappingTerm - (now - downTime))
         output.append(.startTimer(token: token, delay: remaining))
     }
@@ -237,8 +275,8 @@ nonisolated struct HoldTapEngine {
     private mutating func resolveHold(trigger: Buffered?, now: TimeInterval) {
         guard let pending else { return }
         self.pending = nil
-        heldModifiers[pending.keyCode] = pending.modifier
-        output.append(.modifier(pending.modifier, down: true))
+        heldModifiers[pending.keyCode] = pending.modifiers
+        output += pending.modifiers.modifiers.map { .modifier($0, down: true) }
         if let trigger { buffer.append(trigger) }
         replayBuffer(now: now)
     }
@@ -255,8 +293,22 @@ nonisolated struct HoldTapEngine {
 
     // MARK: - Helpers
 
+    /// Releases a key's modifiers, in the reverse of the order they went down.
+    private static func release(_ modifiers: ModifierSet) -> [EngineAction] {
+        modifiers.modifiers.reversed().map { .modifier($0, down: false) }
+    }
+
     private mutating func emit(_ event: KeyEvent) {
         output.append(.key(event.keyCode, down: event.isDown, isRepeat: event.isRepeat))
+    }
+
+    /// Whether a home-row key buffered behind the pending one sits on the other hand from `keyCode`.
+    private func chordHasModifier(oppositeTo keyCode: UInt16) -> Bool {
+        buffer.contains {
+            $0.event.isDown && !$0.event.isRepeat
+                && settings.keyMap[$0.event.keyCode] != nil
+                && !isSameHand($0.event.keyCode, keyCode)
+        }
     }
 
     private func isSameHand(_ a: UInt16, _ b: UInt16) -> Bool {

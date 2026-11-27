@@ -1,4 +1,6 @@
 import Foundation
+import IOKit
+import IOKit.hidsystem
 
 /// Remaps Caps Lock to another key with `hidutil`.
 ///
@@ -6,8 +8,6 @@ import Foundation
 /// avoids Caps Lock's toggle and delay behavior. The mapping lasts until it's cleared or the
 /// Mac restarts.
 enum CapsLockRemap {
-    static let capsLockKeyCode: UInt16 = 57
-
     /// Applies the mapping, or clears it when `keyCode` is `nil` or Caps Lock itself.
     /// Returns `false` if the key can't be mapped or `hidutil` fails.
     ///
@@ -15,8 +15,13 @@ enum CapsLockRemap {
     /// other tools.
     @discardableResult
     static func apply(target keyCode: UInt16?) -> Bool {
+        // Previews show the mapping without changing the Mac's keyboard.
+        if AppEnvironment.isPreview {
+            guard let keyCode else { return true }
+            return canMap(to: keyCode)
+        }
         var mappings: [[String: UInt64]] = []
-        if let keyCode, keyCode != capsLockKeyCode {
+        if let keyCode, keyCode != KeyCode.capsLock {
             guard let usage = hidUsages[keyCode] else { return false }
             mappings.append([
                 "HIDKeyboardModifierMappingSrc": keyboardPage | capsLockUsage,
@@ -41,9 +46,32 @@ enum CapsLockRemap {
         return process.terminationStatus == 0
     }
 
+    /// Flips Caps Lock on or off, light included, as a tap of the real key would. Used
+    /// when Caps Lock has hold modifiers and is tapped. Returns `false` if it couldn't.
+    @discardableResult
+    static func toggleCapsLock() -> Bool {
+        if AppEnvironment.isPreview { return true }
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        guard service != 0 else { return false }
+        defer { IOObjectRelease(service) }
+        var connect: io_connect_t = 0
+        guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &connect) == KERN_SUCCESS else {
+            return false
+        }
+        defer { IOServiceClose(connect) }
+        var isOn = false
+        guard IOHIDGetModifierLockState(connect, Int32(kIOHIDCapsLockState), &isOn) == KERN_SUCCESS else { return false }
+        return IOHIDSetModifierLockState(connect, Int32(kIOHIDCapsLockState), !isOn) == KERN_SUCCESS
+    }
+
+    /// The HID keyboard usage of a key (Caps Lock included), or `nil` if it isn't known.
+    static func hidUsage(for keyCode: UInt16) -> UInt64? {
+        keyCode == KeyCode.capsLock ? capsLockUsage : hidUsages[keyCode]
+    }
+
     /// Whether Caps Lock can be turned into this key.
     static func canMap(to keyCode: UInt16) -> Bool {
-        keyCode == capsLockKeyCode || hidUsages[keyCode] != nil
+        keyCode == KeyCode.capsLock || hidUsages[keyCode] != nil
     }
 
     // MARK: - HID usages
@@ -74,27 +102,5 @@ enum CapsLockRemap {
         124: 0x4F, 123: 0x50, 125: 0x51, 126: 0x52,
         // Modifiers
         59: 0xE0, 56: 0xE1, 58: 0xE2, 55: 0xE3, 62: 0xE4, 60: 0xE5, 61: 0xE6, 54: 0xE7,
-    ]
-}
-
-/// Human-readable names for keys, used when showing what Caps Lock is mapped to.
-enum KeyNames {
-    static func name(for keyCode: UInt16) -> String {
-        if let name = specialNames[keyCode] { return name }
-        if let character = KeyLabels.character(for: keyCode), !character.isEmpty {
-            return character.uppercased()
-        }
-        return "Key \(keyCode)"
-    }
-
-    private static let specialNames: [UInt16: String] = [
-        36: "Return", 48: "Tab", 49: "Space", 51: "Delete", 53: "Esc", 57: "Caps Lock",
-        117: "Fwd Delete", 115: "Home", 119: "End", 116: "Page Up", 121: "Page Down",
-        123: "←", 124: "→", 125: "↓", 126: "↑",
-        59: "Left ⌃", 62: "Right ⌃", 56: "Left ⇧", 60: "Right ⇧",
-        58: "Left ⌥", 61: "Right ⌥", 55: "Left ⌘", 54: "Right ⌘", 63: "fn",
-        122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6", 98: "F7", 100: "F8",
-        101: "F9", 109: "F10", 103: "F11", 111: "F12", 105: "F13", 107: "F14", 113: "F15",
-        106: "F16", 64: "F17", 79: "F18", 80: "F19", 90: "F20",
     ]
 }

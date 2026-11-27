@@ -24,7 +24,7 @@ struct PermissionView: View {
             VStack(alignment: .leading, spacing: 10) {
                 step(1, "Click **Open System Settings**. If macOS shows an alert, choose **Open System Settings** there.")
                 step(2, "Turn on **HomeRower** in the list that opens.")
-                step(3, "Come back here. HomeRower starts by itself; there's no need to quit or reopen it.")
+                step(3, "HomeRower will start when it's ready.")
             }
 
             statusRow
@@ -44,13 +44,6 @@ struct PermissionView: View {
         }
         .padding(24)
         .frame(width: 480)
-    }
-
-    private var permissionName: String {
-        switch eventTap.neededPermission {
-        case .accessibility: "Accessibility"
-        case .inputMonitoring: "Input Monitoring"
-        }
     }
 
     private var explanation: String {
@@ -83,50 +76,95 @@ struct PermissionView: View {
             }
             .foregroundStyle(.secondary)
         } else if eventTap.needsManualRetry {
-            VStack(alignment: .leading, spacing: 8) {
-                Label("HomeRower stopped to keep your keyboard working.", systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text("macOS stopped accepting HomeRower's key events, which happens when HomeRower is removed from the list. Make sure HomeRower is in the list and turned on, then click Try Again.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            WarningBox(
+                title: "HomeRower stopped to keep your keyboard working.",
+                message: "macOS stopped accepting HomeRower's key events, which happens when HomeRower is removed from the list. Make sure HomeRower is in the list and turned on, then click Try Again."
+            ) {
                 HStack {
                     Button("Try Again") {
                         eventTap.retryAfterFailSafe()
                     }
-                    Button("Reset Permission") {
-                        Task { await eventTap.resetPermission() }
-                    }
+                    resetPermissionButton
                 }
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
         } else if eventTap.isTapBlocked {
-            VStack(alignment: .leading, spacing: 8) {
-                Label("HomeRower is turned on, but macOS isn't letting it start.", systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text("This usually happens after HomeRower was rebuilt or moved. Resetting removes the old entry so you can turn it on again.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Reset Permission") {
-                    Task { await eventTap.resetPermission() }
-                }
+            WarningBox(
+                title: "HomeRower is turned on, but macOS isn't letting it start.",
+                message: "This usually happens after HomeRower was rebuilt or moved. Resetting removes the old entry so you can turn it on again."
+            ) {
+                resetPermissionButton
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
         } else {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("Waiting for \(permissionName) access…")
+                Text("Waiting for \(eventTap.neededPermission.displayName) access…")
             }
             .foregroundStyle(.secondary)
         }
     }
+
+    private var resetPermissionButton: some View {
+        Button("Reset Permission") {
+            Task { await eventTap.resetPermission() }
+        }
+    }
 }
 
-#Preview {
-    PermissionView(eventTap: EventTap())
+/// An orange box explaining a problem, with buttons to fix it.
+private struct WarningBox<Actions: View>: View {
+    let title: LocalizedStringKey
+    let message: LocalizedStringKey
+    @ViewBuilder let actions: Actions
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(title, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            actions
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+#Preview("Accessibility") {
+    PermissionView(eventTap: .preview(status: .waitingForPermission))
+}
+
+#Preview("Input Monitoring") {
+    PermissionView(eventTap: .preview(status: .waitingForPermission, neededPermission: .inputMonitoring))
+}
+
+#Preview("Stopped by Fail-Safe") {
+    PermissionView(eventTap: .preview(status: .waitingForPermission, needsManualRetry: true))
+}
+
+#Preview("Tap Blocked") {
+    PermissionView(eventTap: .preview(status: .waitingForPermission, isTapBlocked: true))
+}
+
+#Preview("Resetting Permission") {
+    PermissionView(eventTap: .preview(status: .waitingForPermission, isResettingPermission: true))
+}
+
+#Preview("Warning Box") {
+    WarningBox(title: "Something went wrong.", message: "Well, this never happened before, I swear.") {
+        HStack {
+            HStack {
+                Button("Ignore") {}
+                Button("Report bug") {}
+            }
+            Spacer()
+            HStack {
+                Button("Quit") {}
+            }
+        }
+    }
+    .padding()
+    .frame(width: 480)
 }

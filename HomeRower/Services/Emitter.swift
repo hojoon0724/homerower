@@ -78,7 +78,7 @@ final class Emitter {
     }
 }
 
-private extension Modifier {
+nonisolated extension Modifier {
     /// Generic flag plus the device-dependent left/right bit (NX_DEVICE*KEYMASK),
     /// since some apps distinguish left and right modifiers.
     var flags: CGEventFlags {

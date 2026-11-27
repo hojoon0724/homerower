@@ -12,12 +12,6 @@ final class EventTap {
         case running
     }
 
-    /// A Privacy & Security setting the user has to turn on.
-    enum Permission: Equatable {
-        case accessibility
-        case inputMonitoring
-    }
-
     /// Why HomeRower stopped its own tap to give keyboard input back.
     enum FailSafeReason: Equatable {
         /// A permission check reported that access is off.
@@ -68,7 +62,7 @@ final class EventTap {
     /// Hold if the key is still down after this many milliseconds.
     var tappingTermMs: Double {
         didSet {
-            UserDefaults.standard.set(tappingTermMs, forKey: Self.tappingTermKey)
+            store.tappingTermMs = tappingTermMs
             engine.settings.tappingTerm = tappingTermMs / 1000
         }
     }
@@ -76,26 +70,70 @@ final class EventTap {
     /// Typing-speed rule: tap if pressed within this many milliseconds of the last key (0 = off).
     var priorIdleMs: Double {
         didSet {
-            UserDefaults.standard.set(priorIdleMs, forKey: Self.priorIdleKey)
+            store.priorIdleMs = priorIdleMs
             engine.settings.priorIdle = priorIdleMs / 1000
         }
     }
 
-    /// Physical key → modifier it produces when held.
-    var keyMap: [UInt16: Modifier] {
+    /// The layout in use. Change it with `setModifier`, `setCapsLockTarget` or `select`,
+    /// which keep the system's Caps Lock mapping in step.
+    private(set) var layout: Layout {
         didSet {
-            let stored = Dictionary(uniqueKeysWithValues: keyMap.map { (String($0.key), $0.value.rawValue) })
-            UserDefaults.standard.set(stored, forKey: Self.keyMapKey)
-            engine.settings.keyMap = keyMap
+            store.layout = layout
+            engine.settings.keyMap = Self.engineKeyMap(for: layout)
         }
     }
 
+    /// Layouts the user saved by name.
+    private(set) var savedLayouts: [SavedLayout] {
+        didSet { store.savedLayouts = savedLayouts }
+    }
+
+    /// Which Layout menu entry is in use.
+    private(set) var layoutSelection: LayoutSelection {
+        didSet { store.layoutSelection = layoutSelection }
+    }
+
+    /// The assembly area for unsaved edits. The first edit to any layout copies it here
+    /// with the change, and further edits go here too. It stays while another layout is
+    /// in use, and goes away once saved or discarded. `nil` when there's nothing unsaved.
+    private(set) var customLayout: Layout? {
+        didSet { store.customLayout = customLayout }
+    }
+
+    /// The layout Custom was started from, to go back to if it's discarded while in use.
+    private(set) var customBase: LayoutSelection? {
+        didSet { store.customBase = customBase }
+    }
+
+    /// The user's own Default, or `nil` for the built-in one.
+    private(set) var defaultOverride: Layout? {
+        didSet { store.defaultLayout = defaultOverride }
+    }
+
+    /// An edit that would replace Custom, waiting for the user to decide
+    /// (`confirmPendingEdit`, `cancelPendingEdit` or `saveCustomLayout`).
+    private(set) var pendingEdit: LayoutEdit?
+
+    /// The Default layout: the user's own if they saved one, otherwise the built-in one.
+    var defaultLayout: Layout { defaultOverride ?? .default }
+
+    /// Physical key → modifier it produces when held.
+    var keyMap: [UInt16: ModifierSet] { layout.homeRowMods }
+
     /// The key Caps Lock acts as, or `nil` for normal Caps Lock.
-    private(set) var capsLockTarget: UInt16?
+    var capsLockTarget: UInt16? { layout.capsLockTarget }
+
+    /// Physical keys currently down, for the keyboard view. Only tracked while the tap runs.
+    private(set) var pressedKeys: Set<UInt16> = []
+
+    /// Home-row keys currently held as their modifier, for the keyboard view.
+    private(set) var heldKeys: Set<UInt16> = []
 
     /// While the UI is recording a key, every event passes through untouched.
     @ObservationIgnored var isRecordingKey = false
 
+    @ObservationIgnored private let store: SettingsStore
     @ObservationIgnored private var tap: CFMachPort?
     @ObservationIgnored private var runLoopSource: CFRunLoopSource?
     @ObservationIgnored private var engine = HoldTapEngine()
@@ -116,35 +154,56 @@ final class EventTap {
     /// Times the tap was re-enabled after macOS disabled it, for bounding retries.
     @ObservationIgnored private var tapReenableTimes: [TimeInterval] = []
 
-    private static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "HomeRower", category: "EventTap")
-
+    private static let logger = Logger.homeRower(category: "EventTap")
     private static let maxLogLines = 500
-    private static let tappingTermKey = "tappingTermMs"
-    private static let priorIdleKey = "priorIdleMs"
-    private static let keyMapKey = "keyMap"
-    private static let capsLockTargetKey = "capsLockTarget"
 
-    init() {
-        let defaults = UserDefaults.standard
-        tappingTermMs = defaults.object(forKey: Self.tappingTermKey) as? Double ?? Config.tappingTerm * 1000
-        priorIdleMs = defaults.object(forKey: Self.priorIdleKey) as? Double ?? Config.priorIdle * 1000
-        if let stored = defaults.dictionary(forKey: Self.keyMapKey) as? [String: String] {
-            keyMap = stored.reduce(into: [:]) { map, entry in
-                if let keyCode = UInt16(entry.key), let modifier = Modifier(rawValue: entry.value) {
-                    map[keyCode] = modifier
-                }
-            }
-        } else {
-            keyMap = Config.homeRowMods
+    init(store: SettingsStore = SettingsStore()) {
+        self.store = store
+        tappingTermMs = store.tappingTermMs
+        priorIdleMs = store.priorIdleMs
+        let layout = store.layout
+        let savedLayouts = store.savedLayouts
+        let defaultOverride = store.defaultLayout
+        var customLayout = store.customLayout
+        // Older versions didn't save the selection: work it out from the layout.
+        var selection = store.layoutSelection ?? {
+            if layout == .none { return .preset(.none) }
+            if layout == (defaultOverride ?? .default) { return .preset(.default) }
+            if let saved = savedLayouts.first(where: { $0.layout == layout }) { return .saved(saved.id) }
+            return .custom
+        }()
+        if case .saved(let id) = selection, !savedLayouts.contains(where: { $0.id == id }) {
+            selection = .custom
         }
-        if let stored = defaults.object(forKey: Self.capsLockTargetKey) as? Int {
-            capsLockTarget = UInt16(exactly: stored)
+        if selection == .custom, customLayout == nil {
+            customLayout = layout
         }
+        self.layout = layout
+        self.savedLayouts = savedLayouts
+        self.defaultOverride = defaultOverride
+        self.customLayout = customLayout
+        self.customBase = customLayout == nil ? nil : store.customBase
+        self.layoutSelection = selection
         engine.settings = HoldTapEngine.Settings(
             tappingTerm: tappingTermMs / 1000,
             priorIdle: priorIdleMs / 1000,
-            keyMap: keyMap
+            keyMap: Self.engineKeyMap(for: layout)
         )
+    }
+
+    /// The layout's hold modifiers as the engine sees keys: Caps Lock with hold modifiers
+    /// arrives as its stand-in key.
+    private static func engineKeyMap(for layout: Layout) -> [UInt16: ModifierSet] {
+        var keyMap = layout.homeRowMods
+        if let capsLock = keyMap.removeValue(forKey: KeyCode.capsLock) {
+            keyMap[Config.capsLockStandIn] = capsLock
+        }
+        return keyMap
+    }
+
+    /// The event is Caps Lock, remapped to its stand-in because it has hold modifiers.
+    private func isCapsLockStandIn(_ keyCode: UInt16) -> Bool {
+        keyCode == Config.capsLockStandIn && !layout.capsLockModifiers.isEmpty
     }
 
     func resetTimingsToDefaults() {
@@ -152,48 +211,212 @@ final class EventTap {
         priorIdleMs = Config.priorIdle * 1000
     }
 
-    /// Sets (or clears, with `nil`) the hold modifier for a physical key.
-    func setModifier(_ modifier: Modifier?, for keyCode: UInt16) {
-        keyMap[keyCode] = modifier
+    /// Sets the modifiers a physical key holds down; none makes it type normally.
+    func setModifiers(_ modifiers: ModifierSet, for keyCode: UInt16) {
+        edit(.modifier(modifiers, keyCode: keyCode))
     }
-
-    func resetKeyMapToDefaults() {
-        keyMap = Config.homeRowMods
-    }
-
-    // MARK: - Caps Lock
 
     /// Makes Caps Lock act as another key, or restores it with `nil`.
     /// Returns `false` if the mapping couldn't be applied.
     @discardableResult
     func setCapsLockTarget(_ keyCode: UInt16?) -> Bool {
-        let target = keyCode == CapsLockRemap.capsLockKeyCode ? nil : keyCode
+        edit(.capsLockTarget(keyCode == KeyCode.capsLock ? nil : keyCode))
+    }
+
+    /// Gives Caps Lock hold modifiers (a tap still toggles Caps Lock), or none to make it
+    /// normal again. Returns `false` if the mapping couldn't be applied.
+    @discardableResult
+    func setCapsLockModifiers(_ modifiers: ModifierSet) -> Bool {
+        edit(.capsLockModifiers(modifiers))
+    }
+
+    /// The name of a Layout menu entry.
+    func name(of selection: LayoutSelection) -> String {
+        switch selection {
+        case .preset(let preset): preset.displayName
+        case .saved(let id): savedLayouts.first { $0.id == id }?.name ?? "Custom"
+        case .custom: "Custom"
+        }
+    }
+
+    // MARK: - Choosing layouts
+
+    /// Switches to a preset, a saved layout or Custom. Switching never changes Custom.
+    func select(_ selection: LayoutSelection) {
+        guard let newLayout = layout(for: selection) else { return }
+        apply(newLayout)
+        layoutSelection = selection
+    }
+
+    private func layout(for selection: LayoutSelection) -> Layout? {
+        switch selection {
+        // Spelled out: a bare `.none` here would mean `nil`.
+        case .preset(.none): Layout.none
+        case .preset(.default): defaultLayout
+        case .saved(let id): savedLayouts.first { $0.id == id }?.layout
+        case .custom: customLayout
+        }
+    }
+
+    /// Switches to a whole layout: hold modifiers, Caps Lock and layers.
+    private func apply(_ newLayout: Layout) {
+        if newLayout.capsLockSystemTarget != layout.capsLockSystemTarget {
+            applyCapsLockRemap(newLayout.capsLockSystemTarget)
+        }
+        layout = newLayout
+    }
+
+    // MARK: - Editing
+
+    /// Changes the layout in use. The result is always Custom. If a different, unsaved
+    /// Custom would be replaced, the edit waits in `pendingEdit` for the user instead.
+    /// Returns `false` if the edit couldn't be applied.
+    @discardableResult
+    private func edit(_ edit: LayoutEdit) -> Bool {
+        guard edit.applied(to: layout) != layout else { return true }
+        if layoutSelection != .custom, customLayout != nil {
+            pendingEdit = edit
+            return true
+        }
+        return commit(edit)
+    }
+
+    /// Applies an edit to the layout in use and makes the result Custom.
+    @discardableResult
+    private func commit(_ edit: LayoutEdit) -> Bool {
+        let newLayout = edit.applied(to: layout)
+        if newLayout.capsLockSystemTarget != layout.capsLockSystemTarget {
+            guard applyCapsLockRemap(newLayout.capsLockSystemTarget) else { return false }
+        }
+        if layoutSelection != .custom {
+            customBase = layoutSelection
+        }
+        layout = newLayout
+        customLayout = newLayout
+        layoutSelection = .custom
+        return true
+    }
+
+    /// Replace: the pending edit goes ahead and replaces Custom.
+    func confirmPendingEdit() {
+        guard let pendingEdit else { return }
+        self.pendingEdit = nil
+        commit(pendingEdit)
+    }
+
+    /// Cancel: the pending edit is dropped and nothing changes.
+    func cancelPendingEdit() {
+        pendingEdit = nil
+    }
+
+    // MARK: - Saving
+
+    /// Whether a new layout can be saved under this name.
+    func isNameAvailable(_ name: String) -> Bool {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let taken = LayoutPreset.reservedNames + savedLayouts.map(\.name)
+        return !name.isEmpty && !taken.contains { $0.localizedCaseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    /// Save Layout…: saves the layout in use and switches to the saved copy. Saving
+    /// Custom uses it up, so Custom goes away.
+    func saveCurrentLayout(as target: LayoutSaveTarget) {
+        let wasCustom = layoutSelection == .custom
+        guard let saved = save(layout, as: target) else { return }
+        layoutSelection = saved
+        if wasCustom {
+            clearCustom()
+        }
+    }
+
+    /// Save Custom… from the replace alert: saves Custom, then lets the pending edit
+    /// start a new Custom.
+    func saveCustomLayout(as target: LayoutSaveTarget) {
+        guard let customLayout, let saved = save(customLayout, as: target) else { return }
+        clearCustom()
+        // Saved over the layout in use: switch to its new keys before the edit.
+        if saved == layoutSelection, let updated = layout(for: saved) {
+            apply(updated)
+        }
+        confirmPendingEdit()
+    }
+
+    /// Stores a layout and returns the menu entry it's now under.
+    private func save(_ layoutToSave: Layout, as target: LayoutSaveTarget) -> LayoutSelection? {
+        switch target {
+        case .newLayout(let name):
+            guard isNameAvailable(name) else { return nil }
+            let saved = SavedLayout(name: name.trimmingCharacters(in: .whitespacesAndNewlines), layout: layoutToSave)
+            savedLayouts.append(saved)
+            return .saved(saved.id)
+        case .default:
+            defaultOverride = layoutToSave == .default ? nil : layoutToSave
+            return .preset(.default)
+        case .saved(let id):
+            guard let index = savedLayouts.firstIndex(where: { $0.id == id }) else { return nil }
+            savedLayouts[index].layout = layoutToSave
+            return .saved(id)
+        }
+    }
+
+    // MARK: - Managing
+
+    /// Deletes a saved layout. If it's in use, Default takes over.
+    func deleteLayout(id: SavedLayout.ID) {
+        let wasInUse = layoutSelection == .saved(id)
+        savedLayouts.removeAll { $0.id == id }
+        if customBase == .saved(id) { customBase = nil }
+        if wasInUse { select(.preset(.default)) }
+    }
+
+    /// Throws away Custom. If it's in use, the layout it started from takes over.
+    func discardCustomLayout() {
+        if layoutSelection == .custom {
+            let base = customBase.flatMap { layout(for: $0) == nil ? nil : $0 } ?? .preset(.default)
+            select(base)
+        }
+        clearCustom()
+    }
+
+    /// Brings back the built-in Default.
+    func restoreDefaultLayout() {
+        defaultOverride = nil
+        if layoutSelection == .preset(.default) { apply(defaultLayout) }
+    }
+
+    private func clearCustom() {
+        customLayout = nil
+        customBase = nil
+    }
+
+    // MARK: - Caps Lock
+
+    /// Tells the system to map Caps Lock to `target` (or back to itself) and logs the result.
+    @discardableResult
+    private func applyCapsLockRemap(_ target: UInt16?) -> Bool {
         guard CapsLockRemap.apply(target: target) else {
             log("Failed to remap Caps Lock")
             return false
         }
-        capsLockTarget = target
-        if let target {
-            UserDefaults.standard.set(Int(target), forKey: Self.capsLockTargetKey)
-            log("Caps Lock now acts as \(KeyNames.name(for: target))")
-        } else {
-            UserDefaults.standard.removeObject(forKey: Self.capsLockTargetKey)
-            log("Caps Lock restored")
+        switch target {
+        case nil: log("Caps Lock restored")
+        case Config.capsLockStandIn?: log("Caps Lock now has hold modifiers")
+        case let target?: log("Caps Lock now acts as \(KeyNames.name(for: target))")
         }
         return true
     }
 
     /// Re-applies the saved Caps Lock mapping (called at launch).
     func applyKeyRemapping() {
-        guard let capsLockTarget else { return }
-        if !CapsLockRemap.apply(target: capsLockTarget) {
+        guard let target = layout.capsLockSystemTarget else { return }
+        if !CapsLockRemap.apply(target: target) {
             log("Failed to remap Caps Lock")
         }
     }
 
     /// Removes the Caps Lock mapping from the system without forgetting it (called at quit).
     func clearKeyRemapping() {
-        guard capsLockTarget != nil else { return }
+        guard layout.capsLockSystemTarget != nil else { return }
         CapsLockRemap.apply(target: nil)
     }
 
@@ -202,9 +425,10 @@ final class EventTap {
     /// Starts the tap if access is already on; otherwise waits for it without prompting.
     /// The UI asks for access when the user is ready.
     func start() {
-        guard tap == nil else { return }
+        // A preview's buttons must not put a real tap in front of the keyboard.
+        guard tap == nil, !AppEnvironment.isPreview else { return }
         if !tryStart() {
-            log("Waiting for \(neededPermission == .accessibility ? "Accessibility" : "Input Monitoring") access…")
+            log("Waiting for \(neededPermission.displayName) access…")
             waitForPermission()
         }
     }
@@ -220,13 +444,12 @@ final class EventTap {
         // Input Monitoring: the first time, asking adds HomeRower to the list and macOS
         // shows its own alert with a button that opens the list, so the list isn't opened
         // here as well. macOS only shows that alert once, so after that this opens the list.
-        let promptedKey = Self.promptedKey(for: neededPermission)
-        guard UserDefaults.standard.bool(forKey: promptedKey) else {
-            UserDefaults.standard.set(true, forKey: promptedKey)
+        guard store.hasPrompted(for: neededPermission) else {
+            store.setHasPrompted(true, for: neededPermission)
             _ = CGRequestListenEventAccess()
             return
         }
-        openPrivacySettings(neededPermission)
+        PrivacyAccess.openSettings(for: neededPermission)
     }
 
     /// Always asks macOS, because only asking adds HomeRower back to the list after its
@@ -239,51 +462,29 @@ final class EventTap {
             // The alert takes a moment to appear; look for it for up to a second.
             for _ in 0..<7 {
                 try? await Task.sleep(for: .milliseconds(150))
-                if Self.isAccessibilityAlertShowing() {
+                if PrivacyAccess.isAccessibilityAlertShowing() {
                     self?.log("macOS showed its Accessibility alert; letting it open System Settings")
                     return
                 }
             }
             self?.log("No Accessibility alert from macOS; opening System Settings")
-            self?.openPrivacySettings(.accessibility)
-        }
-    }
-
-    /// Whether macOS's "would like to control this Mac" alert is on screen. It comes from
-    /// the `universalAccessAuthWarn` process. Window owner names are readable without
-    /// Screen Recording access (window titles aren't, and aren't needed).
-    private static func isAccessibilityAlertShowing() -> Bool {
-        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-            as? [[String: Any]] else { return false }
-        return windows.contains { window in
-            (window[kCGWindowOwnerName as String] as? String)?
-                .localizedCaseInsensitiveContains("universalAccessAuthWarn") == true
-        }
-    }
-
-    /// Remembers that macOS has already shown its alert for a permission.
-    private static func promptedKey(for permission: Permission) -> String {
-        switch permission {
-        case .accessibility: "hasPromptedForAccessibility"
-        case .inputMonitoring: "hasPromptedForInputMonitoring"
+            PrivacyAccess.openSettings(for: .accessibility)
         }
     }
 
     /// Removes HomeRower from Privacy & Security and asks again. Fixes an entry that's
     /// on but no longer matches the app, which happens after rebuilding with ad-hoc signing.
     func resetPermission() async {
-        guard let bundleID = Bundle.main.bundleIdentifier, !isResettingPermission else { return }
+        guard let bundleID = Bundle.main.bundleIdentifier, !isResettingPermission, !AppEnvironment.isPreview else { return }
         isResettingPermission = true
         defer { isResettingPermission = false }
 
-        for service in ["Accessibility", "PostEvent", "ListenEvent"] {
-            let exitCode = await Self.runTCCUtil(["reset", service, bundleID])
+        for service in PrivacyAccess.tccServices {
+            let exitCode = await PrivacyAccess.resetEntry(service: service, bundleID: bundleID)
             log("tccutil reset \(service): \(exitCode == 0 ? "ok" : "failed (\(exitCode))")")
         }
         // With the entries gone, macOS shows its alert again, so ask through it.
-        for permission in [Permission.accessibility, .inputMonitoring] {
-            UserDefaults.standard.removeObject(forKey: Self.promptedKey(for: permission))
-        }
+        store.forgetPermissionPrompts()
         neededPermission = .accessibility
         isTapBlocked = false
         blockedAttempts = 0
@@ -352,8 +553,7 @@ final class EventTap {
     /// Permission and tap state in one line, for the log.
     private var diagnostics: String {
         let tapState = tap.map { CGEvent.tapIsEnabled(tap: $0) ? "enabled" : "disabled" } ?? "none"
-        return "Accessibility=\(AXIsProcessTrusted()) PostEvent=\(CGPreflightPostEventAccess()) "
-            + "InputMonitoring=\(CGPreflightListenEventAccess()) tap=\(tapState) status=\(status)"
+        return "\(PrivacyAccess.diagnostics) tap=\(tapState) status=\(status)"
     }
 
     /// While the tap runs, checks four times a second that it still works, and stops it
@@ -420,9 +620,7 @@ final class EventTap {
         // The entry may have been removed, not just switched off. macOS only adds it back
         // through its alert, so ask through the alert again next time.
         if reason == .accessRevoked || reason == .postingBlocked {
-            for permission in [Permission.accessibility, .inputMonitoring] {
-                UserDefaults.standard.removeObject(forKey: Self.promptedKey(for: permission))
-            }
+            store.forgetPermissionPrompts()
         }
 
         // Plain access loss waits for access to come back. Anything else means the checks
@@ -458,20 +656,6 @@ final class EventTap {
                     self.permissionWatcher = nil
                     return
                 }
-            }
-        }
-    }
-
-    private nonisolated static func runTCCUtil(_ arguments: [String]) async -> Int32 {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            process.arguments = arguments
-            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: -1)
             }
         }
     }
@@ -553,9 +737,11 @@ final class EventTap {
         }
 
         // With the tap gone, input flows normally; now drop engine state and release any
-        // synthetic modifiers so nothing is left held down.
+        // synthetic modifiers so nothing is left held down. Key releases won't be seen
+        // any more, so forget what's pressed.
         resetEngine()
         emitter.resetEchoTracking()
+        if !pressedKeys.isEmpty { pressedKeys = [] }
     }
 
     /// macOS disabled the tap. A timeout (the callback was too slow) can be recovered
@@ -599,15 +785,7 @@ final class EventTap {
     /// Re-enables allowed after timeouts within `reenableWindow`.
     private static let maxTimeoutReenables = 3
 
-    func openPrivacySettings(_ permission: Permission) {
-        let pane = switch permission {
-        case .accessibility: "Privacy_Accessibility"
-        case .inputMonitoring: "Privacy_ListenEvent"
-        }
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") {
-            NSWorkspace.shared.open(url)
-        }
-    }
+    // MARK: - Log
 
     func clearLog() {
         logLines.removeAll()
@@ -635,10 +813,28 @@ final class EventTap {
             return Unmanaged.passUnretained(event)
         }
 
+        let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         if type == .flagsChanged {
+            if let isDown = Self.isModifierKeyDown(keyCode, flags: event.flags) {
+                notePhysicalKey(keyCode, isDown: isDown)
+            }
             emitter.hardwareFlags = event.flags
             emitter.applyFlags(to: event)
             return Unmanaged.passUnretained(event)
+        }
+
+        let isCapsLock = isCapsLockStandIn(keyCode)
+        if type == .keyDown || type == .keyUp {
+            notePhysicalKey(isCapsLock ? KeyCode.capsLock : keyCode, isDown: type == .keyDown)
+        }
+
+        // Apps must never see the stand-in key. While the engine is off, Caps Lock is
+        // plain Caps Lock: a press toggles it.
+        if isCapsLock, !isEnabled || isRecordingKey {
+            if type == .keyDown, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                CapsLockRemap.toggleCapsLock()
+            }
+            return nil
         }
 
         guard isEnabled, !isRecordingKey, type == .keyDown || type == .keyUp else {
@@ -646,7 +842,7 @@ final class EventTap {
         }
 
         let keyEvent = KeyEvent(
-            keyCode: UInt16(event.getIntegerValueField(.keyboardEventKeycode)),
+            keyCode: keyCode,
             isDown: type == .keyDown,
             isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
             timestamp: ProcessInfo.processInfo.systemUptime
@@ -662,7 +858,7 @@ final class EventTap {
         }
 
         let actions = engine.handle(keyEvent)
-        if perform(actions) {
+        if perform(actions), !isCapsLock {
             emitter.applyFlags(to: event)
             return Unmanaged.passUnretained(event)
         }
@@ -681,6 +877,9 @@ final class EventTap {
             switch action {
             case .passThrough:
                 passThrough = true
+            case let .key(keyCode, down, isRepeat) where isCapsLockStandIn(keyCode):
+                // Caps Lock was tapped, not held: toggle it, as the key normally would.
+                if down && !isRepeat { CapsLockRemap.toggleCapsLock() }
             case let .key(keyCode, down, isRepeat):
                 emitter.postKey(keyCode, down: down, isRepeat: isRepeat)
             case let .modifier(modifier, down):
@@ -693,7 +892,36 @@ final class EventTap {
                 }
             }
         }
+        updateHeldKeys()
         return passThrough
+    }
+
+    // MARK: - Key state for the keyboard view
+
+    // Observers are notified on every assignment, so these only assign on a real change.
+
+    private func notePhysicalKey(_ keyCode: UInt16, isDown: Bool) {
+        if isDown != pressedKeys.contains(keyCode) {
+            if isDown { pressedKeys.insert(keyCode) } else { pressedKeys.remove(keyCode) }
+        }
+    }
+
+    private func updateHeldKeys() {
+        var held = engine.heldKeys
+        if held.remove(Config.capsLockStandIn) != nil, !layout.capsLockModifiers.isEmpty {
+            held.insert(KeyCode.capsLock)
+        }
+        if held != heldKeys { heldKeys = held }
+    }
+
+    /// Whether a physical modifier key is down, from its `flagsChanged` event; `nil` for
+    /// keys this can't tell (Caps Lock toggles instead).
+    private static func isModifierKeyDown(_ keyCode: UInt16, flags: CGEventFlags) -> Bool? {
+        if keyCode == KeyCode.function { return flags.contains(.maskSecondaryFn) }
+        guard let modifier = Modifier.allCases.first(where: { $0.keyCode == keyCode }) else { return nil }
+        // The device-dependent bit tells left from right.
+        let deviceBit = modifier.flags.subtracting([.maskShift, .maskControl, .maskAlternate, .maskCommand])
+        return flags.contains(deviceBit)
     }
 
     private func resetEngine() {
@@ -715,72 +943,67 @@ final class EventTap {
     }
 }
 
-/// Switches the tap off from a background thread if the main thread stops responding.
-///
-/// The tap is an active filter in front of all keyboard input, and it runs on the main
-/// thread. If that thread hangs (or macOS stops serving the tap while it's still on),
-/// every key press waits on HomeRower, and input to the whole Mac can freeze. A
-/// disabled tap is skipped by the system, so switching it off from here always gives
-/// input back, whatever the main thread is doing.
-nonisolated final class TapWatchdog: @unchecked Sendable {
-    private struct State {
-        var tap: CFMachPort?
-        var lastHeartbeat: UInt64 = 0
-        var didTrip = false
+// MARK: - Previews
+
+extension EventTap {
+    /// An event tap in a given state, for SwiftUI previews. It never creates a real tap,
+    /// and its settings are saved apart from the app's.
+    static func preview(
+        status: Status = .running,
+        isEnabled: Bool = true,
+        neededPermission: Permission = .accessibility,
+        needsManualRetry: Bool = false,
+        isTapBlocked: Bool = false,
+        isResettingPermission: Bool = false,
+        capsLockTarget: UInt16? = nil,
+        capsLockModifiers: ModifierSet = [],
+        logLines: [String] = []
+    ) -> EventTap {
+        let eventTap = EventTap(store: .preview)
+        eventTap.status = status
+        eventTap.isEnabled = isEnabled
+        eventTap.neededPermission = neededPermission
+        eventTap.needsManualRetry = needsManualRetry
+        eventTap.isTapBlocked = isTapBlocked
+        eventTap.isResettingPermission = isResettingPermission
+        eventTap.layout.capsLockTarget = capsLockTarget
+        eventTap.layout.homeRowMods[KeyCode.capsLock] = capsLockModifiers.isEmpty ? nil : capsLockModifiers
+        // Set last: the changes above add their own log lines.
+        eventTap.logLines = logLines
+        return eventTap
     }
 
-    /// How long the main thread may go without a heartbeat before the tap is switched off.
-    private static let limit: UInt64 = 1_500_000_000 // 1.5 s, in nanoseconds
+    /// An event tap with a given set of layouts, for previewing the layout sheets. Preview
+    /// settings persist between runs, so every layout setting is set here, not inherited.
+    static func previewWithLayouts(
+        savedLayouts: Bool = true,
+        modifiedDefault: Bool = true,
+        custom: Bool = true
+    ) -> EventTap {
+        let eventTap = preview()
+        var noPinkies = Layout.default
+        noPinkies.homeRowMods[KeyCode.a] = nil
+        noPinkies.homeRowMods[KeyCode.semicolon] = nil
+        var escCapsLock = Layout.default
+        escCapsLock.capsLockTarget = KeyCode.escape
 
-    private let state = OSAllocatedUnfairLock(uncheckedState: State())
-    private let timer: DispatchSourceTimer
-    /// Switches a tap off. A parameter so tests can check the watchdog without a real tap.
-    private let disableTap: @Sendable (CFMachPort) -> Void
-
-    init(disableTap: @escaping @Sendable (CFMachPort) -> Void = { CGEvent.tapEnable(tap: $0, enable: false) }) {
-        self.disableTap = disableTap
-        let queue = DispatchQueue(label: "HomeRower.TapWatchdog", qos: .userInteractive)
-        timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
-        timer.setEventHandler { [weak self] in self?.check() }
-        timer.resume()
+        eventTap.savedLayouts = savedLayouts
+            ? [SavedLayout(name: "user001", layout: noPinkies), SavedLayout(name: "Gaming", layout: .none)]
+            : []
+        eventTap.defaultOverride = modifiedDefault ? escCapsLock : nil
+        eventTap.customLayout = custom ? escCapsLock.applyingPreviewEdit() : nil
+        eventTap.customBase = custom ? .preset(.default) : nil
+        eventTap.layoutSelection = custom ? .custom : .preset(.default)
+        eventTap.layout = eventTap.customLayout ?? eventTap.defaultLayout
+        eventTap.pendingEdit = nil
+        return eventTap
     }
+}
 
-    /// Starts (or, with `nil`, stops) watching a tap.
-    func watch(_ tap: CFMachPort?) {
-        let now = DispatchTime.now().uptimeNanoseconds
-        state.withLockUnchecked { state in
-            state.tap = tap
-            state.lastHeartbeat = now
-            state.didTrip = false
-        }
-    }
-
-    /// Called regularly from the main thread to show it's still responding.
-    func heartbeat() {
-        let now = DispatchTime.now().uptimeNanoseconds
-        state.withLockUnchecked { $0.lastHeartbeat = now }
-    }
-
-    /// Whether the watchdog switched the tap off since the last call.
-    func takeDidTrip() -> Bool {
-        state.withLockUnchecked { state in
-            defer { state.didTrip = false }
-            return state.didTrip
-        }
-    }
-
-    private func check() {
-        let now = DispatchTime.now().uptimeNanoseconds
-        let tapToDisable: CFMachPort? = state.withLockUnchecked { state in
-            guard let tap = state.tap, !state.didTrip,
-                  now > state.lastHeartbeat, now - state.lastHeartbeat > Self.limit else { return nil }
-            state.didTrip = true
-            return tap
-        }
-        if let tapToDisable {
-            disableTap(tapToDisable)
-        }
+private extension Layout {
+    /// A small change, standing in for the user's unsaved edits in previews.
+    func applyingPreviewEdit() -> Layout {
+        LayoutEdit.modifier(.leftCommand, keyCode: KeyCode.g).applied(to: self)
     }
 }
 

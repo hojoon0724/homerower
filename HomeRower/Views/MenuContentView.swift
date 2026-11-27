@@ -14,8 +14,7 @@ struct MenuContentView: View {
         case .waitingForPermission:
             Text("Waiting for permission")
             Button("Set Up Permission…") {
-                openWindow(id: "main")
-                NSApp.activate()
+                openWindow.bringToFront(.main)
             }
         case .stopped:
             Text("Stopped")
@@ -27,13 +26,11 @@ struct MenuContentView: View {
         Divider()
 
         Button("Open HomeRower…") {
-            openWindow(id: "main")
-            NSApp.activate()
+            openWindow.bringToFront(.main)
         }
         Toggle("Log Key Events", isOn: $eventTap.logsKeyEvents)
         Button("Show Log") {
-            openWindow(id: "log")
-            NSApp.activate()
+            openWindow.bringToFront(.log)
         }
 
         Divider()
@@ -43,4 +40,27 @@ struct MenuContentView: View {
         }
         .keyboardShortcut("q")
     }
+}
+
+// The real menu is drawn by the menu bar; these lay its items out in a column.
+
+#Preview("Running") {
+    VStack(alignment: .leading) {
+        MenuContentView(eventTap: .preview())
+    }
+    .padding()
+}
+
+#Preview("Waiting for Permission") {
+    VStack(alignment: .leading) {
+        MenuContentView(eventTap: .preview(status: .waitingForPermission))
+    }
+    .padding()
+}
+
+#Preview("Stopped") {
+    VStack(alignment: .leading) {
+        MenuContentView(eventTap: .preview(status: .stopped))
+    }
+    .padding()
 }

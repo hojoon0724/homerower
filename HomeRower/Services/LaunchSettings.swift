@@ -16,29 +16,35 @@ final class LaunchSettings {
     /// Open the settings window when HomeRower launches. Off by default: HomeRower lives in
     /// the menu bar. (The window still opens when permission is missing.)
     var opensSettingsAtLaunch: Bool {
-        didSet { UserDefaults.standard.set(opensSettingsAtLaunch, forKey: Self.opensSettingsKey) }
+        didSet { store.opensSettingsAtLaunch = opensSettingsAtLaunch }
     }
 
     /// The launch-time window decision has been made, so it isn't made again.
     @ObservationIgnored var didHandleLaunch = false
 
-    private static let opensSettingsKey = "opensSettingsAtLaunch"
-    private static let didApplyLoginDefaultKey = "didApplyLaunchAtLoginDefault"
-    private static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "HomeRower", category: "LaunchSettings")
+    @ObservationIgnored private let store: SettingsStore
+    private static let logger = Logger.homeRower(category: "LaunchSettings")
 
-    init() {
-        let defaults = UserDefaults.standard
-        opensSettingsAtLaunch = defaults.bool(forKey: Self.opensSettingsKey)
+    init(store: SettingsStore = SettingsStore()) {
+        self.store = store
+        opensSettingsAtLaunch = store.opensSettingsAtLaunch
 
         // Launch at login is on by default. Turn it on once, on first launch; after that,
         // the user's choice (here or in System Settings) is left alone.
         // (Not in Xcode previews, which would add the preview host to Login Items.)
-        let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
-        if !isPreview, !defaults.bool(forKey: Self.didApplyLoginDefaultKey) {
-            defaults.set(true, forKey: Self.didApplyLoginDefaultKey)
+        if !AppEnvironment.isPreview, !store.didApplyLaunchAtLoginDefault {
+            store.didApplyLaunchAtLoginDefault = true
             register()
         }
         refresh()
+    }
+
+    /// Launch settings for SwiftUI previews. The launch-time window decision counts as
+    /// made, so a preview never opens windows.
+    static func preview() -> LaunchSettings {
+        let settings = LaunchSettings(store: .preview)
+        settings.didHandleLaunch = true
+        return settings
     }
 
     /// Adds HomeRower to Login Items, or removes it.
