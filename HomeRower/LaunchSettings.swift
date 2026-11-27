@@ -32,7 +32,9 @@ final class LaunchSettings {
 
         // Launch at login is on by default. Turn it on once, on first launch; after that,
         // the user's choice (here or in System Settings) is left alone.
-        if !defaults.bool(forKey: Self.didApplyLoginDefaultKey) {
+        // (Not in Xcode previews, which would add the preview host to Login Items.)
+        let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+        if !isPreview, !defaults.bool(forKey: Self.didApplyLoginDefaultKey) {
             defaults.set(true, forKey: Self.didApplyLoginDefaultKey)
             register()
         }

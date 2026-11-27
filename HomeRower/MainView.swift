@@ -1,14 +1,16 @@
 import SwiftUI
 
-/// The settings shown in the main window once HomeRower is running: status, timings,
-/// key map and a place to try typing.
+/// The settings shown in the main window once HomeRower is running: status, launch
+/// options, timings, key map and a place to try typing.
 struct MainView: View {
     @Bindable var eventTap: EventTap
+    @Bindable var launchSettings: LaunchSettings
     @Environment(\.openWindow) private var openWindow
     @State private var testText = ""
 
     var body: some View {
         Form {
+            launchSection
             timingSection
             keyMapSection
             testSection
@@ -58,6 +60,33 @@ struct MainView: View {
     }
 
     // MARK: - Sections
+
+    private var launchSection: some View {
+        Section {
+            Toggle("Launch HomeRower at login", isOn: Binding(
+                get: { launchSettings.launchesAtLogin },
+                set: { launchSettings.setLaunchesAtLogin($0) }
+            ))
+            .toggleStyle(.checkbox)
+            if launchSettings.loginItemNeedsApproval {
+                HStack {
+                    Text("Allow HomeRower in Login Items so it can start at login.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Open Login Items…") {
+                        launchSettings.openLoginItemsSettings()
+                    }
+                    .controlSize(.small)
+                }
+            }
+            Toggle("Open this window when HomeRower launches", isOn: $launchSettings.opensSettingsAtLaunch)
+                .toggleStyle(.checkbox)
+        }
+        // Login Items can be changed in System Settings, so re-read it whenever the
+        // window shows.
+        .onAppear { launchSettings.refresh() }
+    }
 
     private var timingSection: some View {
         Section {
@@ -146,7 +175,7 @@ struct MainView: View {
 }
 
 #Preview {
-    MainView(eventTap: EventTap())
+    MainView(eventTap: EventTap(), launchSettings: LaunchSettings())
         .frame(width: 560, height: 820)
 }
 

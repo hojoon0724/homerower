@@ -5,16 +5,18 @@ import SwiftUI
 
     var body: some Scene {
         Window("HomeRower", id: "main") {
-            RootView(eventTap: appDelegate.eventTap)
+            RootView(eventTap: appDelegate.eventTap, launchSettings: appDelegate.launchSettings)
         }
-        .defaultLaunchBehavior(.presented)
+        // The menu bar icon decides whether to open it at launch (see `MenuBarLabel`).
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
         // The window's size follows MainView's frame: fixed width, flexible height.
         .windowResizability(.contentSize)
 
         MenuBarExtra {
             MenuContentView(eventTap: appDelegate.eventTap)
         } label: {
-            MenuBarLabel(eventTap: appDelegate.eventTap)
+            MenuBarLabel(eventTap: appDelegate.eventTap, launchSettings: appDelegate.launchSettings)
         }
 
         Window("HomeRower Log", id: "log") {
@@ -30,12 +32,13 @@ import SwiftUI
 /// then the settings.
 struct RootView: View {
     let eventTap: EventTap
+    let launchSettings: LaunchSettings
 
     var body: some View {
         Group {
             switch eventTap.status {
             case .running:
-                MainView(eventTap: eventTap)
+                MainView(eventTap: eventTap, launchSettings: launchSettings)
             case .waitingForPermission:
                 PermissionView(eventTap: eventTap)
             case .stopped:
@@ -62,24 +65,36 @@ struct RootView: View {
 }
 
 /// The menu bar icon. It's the one view that always exists, even with every window
-/// closed, so it also brings up the permission screen if access is turned off.
+/// closed, so it opens the main window at launch (if the user wants that, or permission
+/// is missing) and brings up the permission screen if access is turned off.
 struct MenuBarLabel: View {
     let eventTap: EventTap
+    let launchSettings: LaunchSettings
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Image(systemName: "oar.2.crossed")
             .accessibilityLabel("HomeRower")
+            .onAppear {
+                guard !launchSettings.didHandleLaunch else { return }
+                launchSettings.didHandleLaunch = true
+                // If the launch check already found permission missing, the status
+                // change below happened before this view existed, so handle it here.
+                if launchSettings.opensSettingsAtLaunch || eventTap.status == .waitingForPermission {
+                    showMainWindow()
+                }
+            }
             .onChange(of: eventTap.status) { oldStatus, newStatus in
                 // Running → waiting means access was turned off or removed. (Stopped →
                 // waiting is the same thing seen mid-way, or the launch check.)
                 guard oldStatus != newStatus, newStatus == .waitingForPermission else { return }
-                showPermissionScreen()
+                showMainWindow()
             }
     }
 
-    /// Opens the main window (it shows the permission screen) in front of everything.
-    private func showPermissionScreen() {
+    /// Opens the main window in front of everything. It shows the permission screen
+    /// while permission is missing, and the settings otherwise.
+    private func showMainWindow() {
         openWindow(id: "main")
         NSApp.activate()
         // SwiftUI names the window after the scene ID, with a suffix.
@@ -92,6 +107,7 @@ struct MenuBarLabel: View {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let eventTap = EventTap()
+    let launchSettings = LaunchSettings()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         eventTap.applyKeyRemapping()

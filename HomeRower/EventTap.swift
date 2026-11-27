@@ -18,8 +18,28 @@ final class EventTap {
         case inputMonitoring
     }
 
-    private(set) var status: Status = .stopped
+    /// Why HomeRower stopped its own tap to give keyboard input back.
+    enum FailSafeReason: Equatable {
+        /// A permission check reported that access is off.
+        case accessRevoked
+        /// Posted events stopped coming back: macOS is rejecting them.
+        case postingBlocked
+        /// macOS kept disabling the tap, or it was disabled and couldn't be re-enabled.
+        case tapDisabledRepeatedly
+        /// The main thread stopped responding and the watchdog switched the tap off.
+        case mainThreadUnresponsive
+    }
+
+    private(set) var status: Status = .stopped {
+        didSet {
+            if status != oldValue { log("Status: \(oldValue) → \(status)") }
+        }
+    }
     private(set) var logLines: [String] = []
+
+    /// HomeRower stopped itself to protect keyboard input more than a couple of times in
+    /// a row, so it won't restart on its own. The permission screen offers Try Again.
+    private(set) var needsManualRetry = false
 
     /// While waiting, the permission the user still needs to turn on. Accessibility is
     /// all an active keyboard tap needs; Input Monitoring is only asked for if the tap
@@ -81,10 +101,22 @@ final class EventTap {
     @ObservationIgnored private var engine = HoldTapEngine()
     @ObservationIgnored private let emitter = Emitter()
     @ObservationIgnored private var permissionWatcher: Task<Void, Never>?
-    /// While running, checks that access is still on.
+    /// While running, checks that access is still on and that the tap still works.
     @ObservationIgnored private var accessMonitor: Task<Void, Never>?
+    /// Switches the tap off from a background thread if the main thread hangs.
+    @ObservationIgnored private let watchdog = TapWatchdog()
     /// Failed tap attempts in a row while access looked granted.
     @ObservationIgnored private var blockedAttempts = 0
+    /// Fail-safe stops in a row (other than plain access loss), for backing off restarts.
+    @ObservationIgnored private var consecutiveFailSafes = 0
+    /// No automatic restart before this time (system uptime), after a fail-safe stop.
+    @ObservationIgnored private var restartNotBefore: TimeInterval?
+    /// When the current tap started (system uptime).
+    @ObservationIgnored private var tapStartedAt: TimeInterval?
+    /// Times the tap was re-enabled after macOS disabled it, for bounding retries.
+    @ObservationIgnored private var tapReenableTimes: [TimeInterval] = []
+
+    private static let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "HomeRower", category: "EventTap")
 
     private static let maxLogLines = 500
     private static let tappingTermKey = "tappingTermMs"
@@ -180,23 +212,53 @@ final class EventTap {
     // MARK: - Permissions
 
     /// Gets HomeRower into the list in Privacy & Security so the user can turn it on.
-    ///
-    /// The first time, this asks macOS, which adds HomeRower to the list and shows its own
-    /// alert with a button that opens the list, so the list isn't opened here as well.
-    /// macOS only shows that alert once, so after that this opens the list directly.
     func requestPermission() {
+        if neededPermission == .accessibility {
+            requestAccessibility()
+            return
+        }
+        // Input Monitoring: the first time, asking adds HomeRower to the list and macOS
+        // shows its own alert with a button that opens the list, so the list isn't opened
+        // here as well. macOS only shows that alert once, so after that this opens the list.
         let promptedKey = Self.promptedKey(for: neededPermission)
         guard UserDefaults.standard.bool(forKey: promptedKey) else {
             UserDefaults.standard.set(true, forKey: promptedKey)
-            switch neededPermission {
-            case .accessibility:
-                _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-            case .inputMonitoring:
-                _ = CGRequestListenEventAccess()
-            }
+            _ = CGRequestListenEventAccess()
             return
         }
         openPrivacySettings(neededPermission)
+    }
+
+    /// Always asks macOS, because only asking adds HomeRower back to the list after its
+    /// entry was deleted (if the entry exists, asking does no harm). macOS sometimes answers
+    /// with its own alert, whose button opens the list; if it doesn't, the list is opened
+    /// here instead, so the user never gets the alert and the list at the same time.
+    private func requestAccessibility() {
+        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        Task { [weak self] in
+            // The alert takes a moment to appear; look for it for up to a second.
+            for _ in 0..<7 {
+                try? await Task.sleep(for: .milliseconds(150))
+                if Self.isAccessibilityAlertShowing() {
+                    self?.log("macOS showed its Accessibility alert; letting it open System Settings")
+                    return
+                }
+            }
+            self?.log("No Accessibility alert from macOS; opening System Settings")
+            self?.openPrivacySettings(.accessibility)
+        }
+    }
+
+    /// Whether macOS's "would like to control this Mac" alert is on screen. It comes from
+    /// the `universalAccessAuthWarn` process. Window owner names are readable without
+    /// Screen Recording access (window titles aren't, and aren't needed).
+    private static func isAccessibilityAlertShowing() -> Bool {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] else { return false }
+        return windows.contains { window in
+            (window[kCGWindowOwnerName as String] as? String)?
+                .localizedCaseInsensitiveContains("universalAccessAuthWarn") == true
+        }
     }
 
     /// Remembers that macOS has already shown its alert for a permission.
@@ -225,6 +287,9 @@ final class EventTap {
         neededPermission = .accessibility
         isTapBlocked = false
         blockedAttempts = 0
+        needsManualRetry = false
+        restartNotBefore = nil
+        consecutiveFailSafes = 0
         requestPermission()
     }
 
@@ -237,8 +302,17 @@ final class EventTap {
             neededPermission = .accessibility
             isTapBlocked = false
             blockedAttempts = 0
+            // Access being off now means the user is turning it back on, so the next
+            // time it's on is a fresh start, not a retry of a failed tap.
+            needsManualRetry = false
+            restartNotBefore = nil
             return false
         }
+        // After a fail-safe stop, don't put a tap back in front of the keyboard until
+        // the back-off has passed, or at all once it has failed too often.
+        if needsManualRetry { return false }
+        if let restartNotBefore, ProcessInfo.processInfo.systemUptime < restartNotBefore { return false }
+
         if createTap() { return true }
 
         blockedAttempts += 1
@@ -250,42 +324,126 @@ final class EventTap {
         return false
     }
 
+    /// Starts again after HomeRower stopped itself too often to restart on its own.
+    func retryAfterFailSafe() {
+        log("Try Again pressed")
+        needsManualRetry = false
+        restartNotBefore = nil
+        consecutiveFailSafes = 0
+        if tryStart() {
+            permissionWatcher?.cancel()
+            permissionWatcher = nil
+        } else {
+            waitForPermission()
+        }
+    }
+
     /// Whether the access the running tap depends on is still on.
+    ///
+    /// These checks report what's in Privacy & Security, not whether the tap works: when
+    /// HomeRower's entry is deleted, they can keep reporting access while macOS rejects
+    /// its events. The echo check in `monitorTap()` covers that.
     private var hasRequiredAccess: Bool {
         guard AXIsProcessTrusted() else { return false }
         // Input Monitoring only matters if this Mac needed it to start the tap.
         return neededPermission != .inputMonitoring || CGPreflightListenEventAccess()
     }
 
-    /// Checks once a second while running, so switching HomeRower off (or removing it)
-    /// in Privacy & Security stops it right away instead of leaving a dead tap.
-    private func monitorAccess() {
+    /// Permission and tap state in one line, for the log.
+    private var diagnostics: String {
+        let tapState = tap.map { CGEvent.tapIsEnabled(tap: $0) ? "enabled" : "disabled" } ?? "none"
+        return "Accessibility=\(AXIsProcessTrusted()) PostEvent=\(CGPreflightPostEventAccess()) "
+            + "InputMonitoring=\(CGPreflightListenEventAccess()) tap=\(tapState) status=\(status)"
+    }
+
+    /// While the tap runs, checks four times a second that it still works, and stops it
+    /// (giving input back) as soon as anything looks wrong:
+    /// - the watchdog switched it off because the main thread hung,
+    /// - posted events stopped coming back (macOS is rejecting them),
+    /// - macOS reports it disabled,
+    /// - a permission check reports access is off.
+    private func monitorTap() {
         accessMonitor?.cancel()
         accessMonitor = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                guard let self, !Task.isCancelled else { return }
-                if !self.hasRequiredAccess {
-                    self.accessWasRevoked()
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, !Task.isCancelled, let tap = self.tap else { return }
+                tick += 1
+                let now = ProcessInfo.processInfo.systemUptime
+
+                // Before the heartbeat, so a trip from a hang that just ended is seen.
+                if self.watchdog.takeDidTrip() {
+                    self.failSafeStop(.mainThreadUnresponsive, detectedBy: "watchdog")
                     return
+                }
+                self.watchdog.heartbeat()
+
+                if let since = self.emitter.awaitingEchoSince, now - since > Self.echoTimeout {
+                    self.failSafeStop(.postingBlocked, detectedBy: "echo check")
+                    return
+                }
+
+                // The rest involves IPC to the system, so only once a second.
+                guard tick % 4 == 0 else { continue }
+                if !self.hasRequiredAccess {
+                    self.failSafeStop(.accessRevoked, detectedBy: "access monitor")
+                    return
+                }
+                // A disabled tap is handled by `handleTapDisabled`; if it stays disabled
+                // with no notification, stop rather than leave a dead tap installed.
+                if !CGEvent.tapIsEnabled(tap: tap), self.tapReenableTimes.isEmpty {
+                    self.failSafeStop(.tapDisabledRepeatedly, detectedBy: "access monitor")
+                    return
+                }
+                // Running fine for a while: earlier failures no longer count toward giving up.
+                if let started = self.tapStartedAt, now - started > 60 {
+                    self.consecutiveFailSafes = 0
                 }
             }
         }
     }
 
-    /// Stops the tap and goes back to waiting, which brings back the permission screen.
-    private func accessWasRevoked() {
-        log("Access was turned off in Privacy & Security. Stopping until it's back on.")
-        stop()
+    /// How long a posted event may take to come back before posting counts as blocked.
+    private static let echoTimeout: TimeInterval = 0.5
+
+    /// Gives keyboard input back first, then works out when to try again.
+    ///
+    /// The tap comes down before anything else, so input recovers even if the rest
+    /// (logging, UI) goes wrong. Safe to call repeatedly.
+    private func failSafeStop(_ reason: FailSafeReason, detectedBy source: String) {
+        guard tap != nil else { return }
+        let before = diagnostics
+        teardownTap()
+        log("Fail-safe stop (\(reason), detected by \(source)). Before: \(before)")
+
         // The entry may have been removed, not just switched off. macOS only adds it back
         // through its alert, so ask through the alert again next time.
-        for permission in [Permission.accessibility, .inputMonitoring] {
-            UserDefaults.standard.removeObject(forKey: Self.promptedKey(for: permission))
+        if reason == .accessRevoked || reason == .postingBlocked {
+            for permission in [Permission.accessibility, .inputMonitoring] {
+                UserDefaults.standard.removeObject(forKey: Self.promptedKey(for: permission))
+            }
         }
-        if !tryStart() {
-            waitForPermission()
+
+        // Plain access loss waits for access to come back. Anything else means the checks
+        // said yes but the tap didn't work, so back off, and after a couple of tries stop
+        // trying until the user says so, rather than trap the keyboard again and again.
+        if reason != .accessRevoked {
+            consecutiveFailSafes += 1
+            if consecutiveFailSafes > Self.restartDelays.count {
+                needsManualRetry = true
+                log("Not restarting on its own after \(consecutiveFailSafes) fail-safe stops; waiting for Try Again")
+            } else {
+                let delay = Self.restartDelays[consecutiveFailSafes - 1]
+                restartNotBefore = ProcessInfo.processInfo.systemUptime + delay
+                log("Will try again in \(Int(delay)) s if access looks on")
+            }
         }
+        waitForPermission()
     }
+
+    /// Back-off before each automatic restart after a fail-safe stop.
+    private static let restartDelays: [TimeInterval] = [3, 10]
 
     /// Checks twice a second until the tap can be created, so turning access on in
     /// System Settings starts the app without quitting or pressing anything.
@@ -345,32 +503,101 @@ final class EventTap {
 
         self.tap = tap
         self.runLoopSource = source
+        tapStartedAt = ProcessInfo.processInfo.systemUptime
+        tapReenableTimes = []
+        emitter.resetEchoTracking()
+        watchdog.watch(tap)
         permissionWatcher?.cancel()
         permissionWatcher = nil
         isTapBlocked = false
         blockedAttempts = 0
+        restartNotBefore = nil
         status = .running
-        log("Event tap running")
-        monitorAccess()
+        log("Event tap running. \(diagnostics)")
+        monitorTap()
         return true
     }
 
+    /// Stops the tap and every task around it.
     func stop() {
         permissionWatcher?.cancel()
         permissionWatcher = nil
-        accessMonitor?.cancel()
-        accessMonitor = nil
-        resetEngine()
-        if let tap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-        }
-        if let runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        }
-        tap = nil
-        runLoopSource = nil
+        teardownTap()
         status = .stopped
     }
+
+    /// Removes the tap so it can't intercept input any more, then releases any modifiers
+    /// HomeRower is holding. Safe to call repeatedly, and never called from inside the
+    /// tap callback.
+    private func teardownTap() {
+        accessMonitor?.cancel()
+        accessMonitor = nil
+
+        // Forget the tap first, so nothing (including the watchdog) can touch it again.
+        let oldTap = tap
+        let oldSource = runLoopSource
+        tap = nil
+        runLoopSource = nil
+        tapStartedAt = nil
+        tapReenableTimes = []
+        watchdog.watch(nil)
+
+        if let oldTap {
+            CGEvent.tapEnable(tap: oldTap, enable: false)
+        }
+        if let oldSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), oldSource, .commonModes)
+        }
+        if let oldTap {
+            CFMachPortInvalidate(oldTap)
+        }
+
+        // With the tap gone, input flows normally; now drop engine state and release any
+        // synthetic modifiers so nothing is left held down.
+        resetEngine()
+        emitter.resetEchoTracking()
+    }
+
+    /// macOS disabled the tap. A timeout (the callback was too slow) can be recovered
+    /// from a few times; anything else, or a tap that keeps getting disabled, is a sign
+    /// macOS doesn't want it, so it comes down instead of being forced back on.
+    private func handleTapDisabled(byTimeout: Bool) {
+        guard status == .running, let tap else { return }
+        let kind = byTimeout ? "timeout" : "user input"
+        log("macOS disabled the tap (\(kind)). \(diagnostics)")
+
+        if watchdog.takeDidTrip() {
+            failSafeStop(.mainThreadUnresponsive, detectedBy: "watchdog")
+            return
+        }
+        guard hasRequiredAccess else {
+            failSafeStop(.accessRevoked, detectedBy: "tap disabled (\(kind))")
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        tapReenableTimes.removeAll { now - $0 > Self.reenableWindow }
+        // Timeouts get a few retries per window; a disable for user input only one.
+        let limit = byTimeout ? Self.maxTimeoutReenables : 1
+        guard tapReenableTimes.count < limit else {
+            failSafeStop(.tapDisabledRepeatedly, detectedBy: "tap disabled (\(kind))")
+            return
+        }
+
+        tapReenableTimes.append(now)
+        // Events posted while the tap was off never come back; don't count them.
+        emitter.resetEchoTracking()
+        CGEvent.tapEnable(tap: tap, enable: true)
+        let isEnabled = CGEvent.tapIsEnabled(tap: tap)
+        log("Re-enabled the tap (\(tapReenableTimes.count) of \(limit) in \(Int(Self.reenableWindow)) s); enabled=\(isEnabled)")
+        if !isEnabled {
+            failSafeStop(.tapDisabledRepeatedly, detectedBy: "re-enable failed")
+        }
+    }
+
+    /// How far back re-enables count toward the limit.
+    private static let reenableWindow: TimeInterval = 30
+    /// Re-enables allowed after timeouts within `reenableWindow`.
+    private static let maxTimeoutReenables = 3
 
     func openPrivacySettings(_ permission: Permission) {
         let pane = switch permission {
@@ -391,24 +618,20 @@ final class EventTap {
     fileprivate func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
-            // macOS also disables the tap when access is turned off. Don't fight that.
-            guard hasRequiredAccess else {
-                // Tear the tap down after this callback returns, not from inside it.
-                Task { [weak self] in
-                    guard let self, self.status == .running else { return }
-                    self.accessWasRevoked()
-                }
-                return Unmanaged.passUnretained(event)
-            }
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            log("Tap was disabled (\(type == .tapDisabledByTimeout ? "timeout" : "user input")), re-enabled")
+            // The tap is off now, so input already passes through. Decide what to do after
+            // this callback returns: the decision involves permission IPC and may tear the
+            // tap down, neither of which belongs inside the callback.
+            let byTimeout = type == .tapDisabledByTimeout
+            Task { [weak self] in self?.handleTapDisabled(byTimeout: byTimeout) }
             return Unmanaged.passUnretained(event)
         default:
             break
         }
 
-        // Our own posted events come back through the tap: leave them alone.
+        // Our own posted events come back through the tap: leave them alone. Their coming
+        // back also shows that macOS is still accepting them.
         if event.getIntegerValueField(.eventSourceUserData) == Config.syntheticEventTag {
+            emitter.noteEcho()
             return Unmanaged.passUnretained(event)
         }
 
@@ -435,7 +658,7 @@ final class EventTap {
                 keyEvent.keyCode,
                 keyEvent.isRepeat ? " (repeat)" : "",
                 keyEvent.timestamp
-            ))
+            ), isKeyEvent: true)
         }
 
         let actions = engine.handle(keyEvent)
@@ -462,7 +685,7 @@ final class EventTap {
                 emitter.postKey(keyCode, down: down, isRepeat: isRepeat)
             case let .modifier(modifier, down):
                 emitter.setModifier(modifier, down: down)
-                if logsKeyEvents { log("\(down ? "Hold" : "Release") \(modifier.rawValue)") }
+                if logsKeyEvents { log("\(down ? "Hold" : "Release") \(modifier.rawValue)", isKeyEvent: true) }
             case let .startTimer(token, delay):
                 Task { [weak self] in
                     try? await Task.sleep(for: .seconds(delay))
@@ -478,7 +701,13 @@ final class EventTap {
         emitter.releaseAllModifiers()
     }
 
-    private func log(_ message: String) {
+    /// Adds a line to the in-app log. Lifecycle messages also go to the system log
+    /// (`log show --predicate 'subsystem == "<bundle ID>"'`), so they survive a forced
+    /// restart. Key events never do: `isKeyEvent` keeps typing out of the system log.
+    private func log(_ message: String, isKeyEvent: Bool = false) {
+        if !isKeyEvent {
+            Self.logger.notice("\(message, privacy: .public)")
+        }
         logLines.append(message)
         if logLines.count > Self.maxLogLines {
             logLines.removeFirst(logLines.count - Self.maxLogLines)
@@ -505,8 +734,11 @@ nonisolated final class TapWatchdog: @unchecked Sendable {
 
     private let state = OSAllocatedUnfairLock(uncheckedState: State())
     private let timer: DispatchSourceTimer
+    /// Switches a tap off. A parameter so tests can check the watchdog without a real tap.
+    private let disableTap: @Sendable (CFMachPort) -> Void
 
-    init() {
+    init(disableTap: @escaping @Sendable (CFMachPort) -> Void = { CGEvent.tapEnable(tap: $0, enable: false) }) {
+        self.disableTap = disableTap
         let queue = DispatchQueue(label: "HomeRower.TapWatchdog", qos: .userInteractive)
         timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
@@ -547,7 +779,7 @@ nonisolated final class TapWatchdog: @unchecked Sendable {
             return tap
         }
         if let tapToDisable {
-            CGEvent.tapEnable(tap: tapToDisable, enable: false)
+            disableTap(tapToDisable)
         }
     }
 }
