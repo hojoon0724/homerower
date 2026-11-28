@@ -16,7 +16,7 @@ nonisolated enum Config {
     /// Tap then hold within this = key repeat (milestone 9, not used yet).
     static let quickTap: TimeInterval = 0.175
 
-    /// The key Caps Lock is remapped to (with `hidutil`) while it has hold modifiers, so the
+    /// The key Caps Lock is remapped to (at the HID level) while it has hold modifiers, so the
     /// event tap sees ordinary key presses instead of Caps Lock's toggle. Rarely on keyboards.
     static let capsLockStandIn = KeyCode.f18
 

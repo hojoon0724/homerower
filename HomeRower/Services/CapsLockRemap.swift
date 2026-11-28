@@ -2,14 +2,14 @@ import Foundation
 import IOKit
 import IOKit.hidsystem
 
-/// Remaps Caps Lock to another key with `hidutil`.
+/// Remaps Caps Lock to another key through the HID event system.
 ///
 /// This happens at the HID driver level, before the event tap, so it works in every app and
 /// avoids Caps Lock's toggle and delay behavior. The mapping lasts until it's cleared or the
 /// Mac restarts.
 enum CapsLockRemap {
     /// Applies the mapping, or clears it when `keyCode` is `nil` or Caps Lock itself.
-    /// Returns `false` if the key can't be mapped or `hidutil` fails.
+    /// Returns `false` if the key can't be mapped or the HID event system refuses it.
     ///
     /// Note: this replaces the whole `UserKeyMapping` property, including mappings made by
     /// other tools.
@@ -28,22 +28,27 @@ enum CapsLockRemap {
                 "HIDKeyboardModifierMappingDst": keyboardPage | usage,
             ])
         }
-        guard let json = try? JSONSerialization.data(withJSONObject: ["UserKeyMapping": mappings]),
-              let argument = String(data: json, encoding: .utf8) else {
-            return false
-        }
+        return setUserKeyMapping(mappings)
+    }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/hidutil")
-        process.arguments = ["property", "--set", argument]
-        process.standardOutput = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
+    /// What `hidutil property --set` does, in-process, since the sandbox blocks launching
+    /// `hidutil`. Setting it on the event system also covers keyboards plugged in later;
+    /// per-keyboard is the fallback.
+    private static func setUserKeyMapping(_ mappings: [[String: UInt64]]) -> Bool {
+        let key = "UserKeyMapping" as CFString
+        let value = mappings as CFArray
+        let client = IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault)
+        if IOHIDEventSystemClientSetProperty(client, key, value) { return true }
+
+        guard let services = IOHIDEventSystemClientCopyServices(client) as? [IOHIDServiceClient] else {
             return false
         }
-        return process.terminationStatus == 0
+        var didSetAny = false
+        for service in services
+        where IOHIDServiceClientConformsTo(service, UInt32(kHIDPage_GenericDesktop), UInt32(kHIDUsage_GD_Keyboard)) != 0 {
+            if IOHIDServiceClientSetProperty(service, key, value) { didSetAny = true }
+        }
+        return didSetAny
     }
 
     /// Flips Caps Lock on or off, light included, as a tap of the real key would. Used

@@ -68,8 +68,6 @@ nonisolated enum Modifier: String, CaseIterable, Sendable {
     static let displayOrder: [Modifier] = [
         .leftShift, leftControl,leftOption,leftCommand,
         .rightCommand,rightOption,rightControl,rightShift
-//        .leftControl, .rightControl, .leftOption, .rightOption,
-//        .leftShift, .rightShift, .leftCommand, .rightCommand,
     ]
 
     /// Which side of the keyboard the modifier is on, shown next to the symbol on a key cap.

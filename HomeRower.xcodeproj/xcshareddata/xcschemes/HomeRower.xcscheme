@@ -17,6 +17,7 @@
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "000000000000000100000000"
                BuildableName = "HomeRower.app"
+               BlueprintName = "HomeRower"
                ReferencedContainer = "container:HomeRower.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -57,6 +58,7 @@
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000100000000"
             BuildableName = "HomeRower.app"
+            BlueprintName = "HomeRower"
             ReferencedContainer = "container:HomeRower.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -73,6 +75,7 @@
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "000000000000000100000000"
             BuildableName = "HomeRower.app"
+            BlueprintName = "HomeRower"
             ReferencedContainer = "container:HomeRower.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

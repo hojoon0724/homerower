@@ -101,17 +101,6 @@ final class SettingsStoreTests {
         #expect(normal == .default)
     }
 
-    @Test func forgettingPromptsClearsEveryPermission() {
-        for permission in Permission.allCases {
-            store.setHasPrompted(true, for: permission)
-            #expect(store.hasPrompted(for: permission))
-        }
-        store.forgetPermissionPrompts()
-        for permission in Permission.allCases {
-            #expect(!store.hasPrompted(for: permission))
-        }
-    }
-
     /// Settings changed in the UI go through `EventTap` and must end up saved.
     @Test func eventTapLoadsAndSavesThroughTheStore() {
         store.tappingTermMs = 300

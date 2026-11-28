@@ -30,13 +30,6 @@ nonisolated struct SettingsStore {
         static let legacyCapsLockTarget = "capsLockTarget"
         static let opensSettingsAtLaunch = "opensSettingsAtLaunch"
         static let didApplyLaunchAtLoginDefault = "didApplyLaunchAtLoginDefault"
-
-        static func hasPrompted(for permission: Permission) -> String {
-            switch permission {
-            case .accessibility: "hasPromptedForAccessibility"
-            case .inputMonitoring: "hasPromptedForInputMonitoring"
-            }
-        }
     }
 
     // MARK: - Timing
@@ -148,23 +141,5 @@ nonisolated struct SettingsStore {
     var didApplyLaunchAtLoginDefault: Bool {
         get { defaults.bool(forKey: Key.didApplyLaunchAtLoginDefault) }
         nonmutating set { defaults.set(newValue, forKey: Key.didApplyLaunchAtLoginDefault) }
-    }
-
-    // MARK: - Permission prompts
-
-    /// Whether macOS has already shown its own alert for a permission.
-    func hasPrompted(for permission: Permission) -> Bool {
-        defaults.bool(forKey: Key.hasPrompted(for: permission))
-    }
-
-    func setHasPrompted(_ value: Bool, for permission: Permission) {
-        defaults.set(value, forKey: Key.hasPrompted(for: permission))
-    }
-
-    /// Forgets every shown alert, so the next request goes through macOS's alert again.
-    func forgetPermissionPrompts() {
-        for permission in Permission.allCases {
-            defaults.removeObject(forKey: Key.hasPrompted(for: permission))
-        }
     }
 }

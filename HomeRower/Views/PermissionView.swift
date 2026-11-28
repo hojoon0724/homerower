@@ -15,17 +15,20 @@ struct PermissionView: View {
                     Text("Allow HomeRower to Use Your Keyboard")
                         .font(.title2)
                         .fontWeight(.semibold)
-                    Text(explanation)
+                    Text("HomeRower needs Accessibility access to read your key presses and send modifiers in their place.")
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                step(1, "Click **Open System Settings**. If macOS shows an alert, choose **Open System Settings** there.")
-                step(2, "Turn on **HomeRower** in the list that opens.")
-                step(3, "HomeRower will start when it's ready.")
+                step(1, "Click **Open System Settings**.")
+                step(2, "Drag HomeRower's icon below into the list, or click **+** and choose HomeRower.")
+                step(3, "Turn on **HomeRower**. It starts on its own.")
             }
+
+            AppIconDragSource()
+                .frame(maxWidth: .infinity)
 
             statusRow
 
@@ -34,25 +37,14 @@ struct PermissionView: View {
                     NSApp.terminate(nil)
                 }
                 Spacer()
-                Button("Open System Settings") {
-                    eventTap.requestPermission()
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
+                openSettingsButton
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
             }
             .controlSize(.large)
         }
         .padding(24)
         .frame(width: 480)
-    }
-
-    private var explanation: String {
-        switch eventTap.neededPermission {
-        case .accessibility:
-            "HomeRower needs Accessibility access to read your key presses and send modifiers in their place."
-        case .inputMonitoring:
-            "Accessibility is on. On this Mac, HomeRower also needs Input Monitoring to read key presses."
-        }
     }
 
     private func step(_ number: Int, _ text: LocalizedStringKey) -> some View {
@@ -66,16 +58,9 @@ struct PermissionView: View {
         }
     }
 
-    /// Live feedback: waiting, resetting, or stuck with a way out.
     @ViewBuilder
     private var statusRow: some View {
-        if eventTap.isResettingPermission {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Resetting HomeRower's permission…")
-            }
-            .foregroundStyle(.secondary)
-        } else if eventTap.needsManualRetry {
+        if eventTap.needsManualRetry {
             WarningBox(
                 title: "HomeRower stopped to keep your keyboard working.",
                 message: "macOS stopped accepting HomeRower's key events, which happens when HomeRower is removed from the list. Make sure HomeRower is in the list and turned on, then click Try Again."
@@ -84,28 +69,47 @@ struct PermissionView: View {
                     Button("Try Again") {
                         eventTap.retryAfterFailSafe()
                     }
-                    resetPermissionButton
+                    openSettingsButton
                 }
             }
         } else if eventTap.isTapBlocked {
             WarningBox(
                 title: "HomeRower is turned on, but macOS isn't letting it start.",
-                message: "This usually happens after HomeRower was rebuilt or moved. Resetting removes the old entry so you can turn it on again."
+                message: "HomeRower's entry in the list is out of date, which happens after HomeRower was rebuilt or moved. Select HomeRower in the list, click **−** to remove it, then add it again."
             ) {
-                resetPermissionButton
+                openSettingsButton
             }
         } else {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("Waiting for \(eventTap.neededPermission.displayName) access…")
+                Text("Waiting for Accessibility access…")
             }
             .foregroundStyle(.secondary)
         }
     }
 
-    private var resetPermissionButton: some View {
-        Button("Reset Permission") {
-            Task { await eventTap.resetPermission() }
+    private var openSettingsButton: some View {
+        Button("Open System Settings") {
+            PrivacyAccess.openAccessibilitySettings()
+        }
+    }
+}
+
+private struct AppIconDragSource: View {
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(nsImage: PrivacyAccess.appIcon)
+                .resizable()
+                .frame(width: 56, height: 56)
+                .onDrag { NSItemProvider(object: PrivacyAccess.appURL as NSURL) }
+                .help("Drag into the Accessibility list")
+                .accessibilityLabel("HomeRower app icon")
+                .accessibilityHint("Drag into the Accessibility list in System Settings")
+            Button("Show in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([PrivacyAccess.appURL])
+            }
+            .buttonStyle(.link)
+            .font(.callout)
         }
     }
 }
@@ -136,20 +140,12 @@ private struct WarningBox<Actions: View>: View {
     PermissionView(eventTap: .preview(status: .waitingForPermission))
 }
 
-#Preview("Input Monitoring") {
-    PermissionView(eventTap: .preview(status: .waitingForPermission, neededPermission: .inputMonitoring))
-}
-
 #Preview("Stopped by Fail-Safe") {
     PermissionView(eventTap: .preview(status: .waitingForPermission, needsManualRetry: true))
 }
 
 #Preview("Tap Blocked") {
     PermissionView(eventTap: .preview(status: .waitingForPermission, isTapBlocked: true))
-}
-
-#Preview("Resetting Permission") {
-    PermissionView(eventTap: .preview(status: .waitingForPermission, isResettingPermission: true))
 }
 
 #Preview("Warning Box") {

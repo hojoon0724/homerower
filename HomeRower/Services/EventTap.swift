@@ -35,17 +35,9 @@ final class EventTap {
     /// a row, so it won't restart on its own. The permission screen offers Try Again.
     private(set) var needsManualRetry = false
 
-    /// While waiting, the permission the user still needs to turn on. Accessibility is
-    /// all an active keyboard tap needs; Input Monitoring is only asked for if the tap
-    /// still can't be created once Accessibility is on.
-    private(set) var neededPermission: Permission = .accessibility
-
-    /// Access is on, but the tap still can't be created. This usually means a stale
-    /// Privacy & Security entry, e.g. after rebuilding with a different signature.
+    /// Accessibility is on, but the tap still can't be created: a stale entry (e.g. after
+    /// re-signing) or a denied PostEvent entry. Removing and re-adding HomeRower fixes both.
     private(set) var isTapBlocked = false
-
-    /// A permission reset is in progress.
-    private(set) var isResettingPermission = false
 
     /// When off, every event passes through untouched.
     var isEnabled = true {
@@ -422,85 +414,19 @@ final class EventTap {
 
     // MARK: - Lifecycle
 
-    /// Starts the tap if access is already on; otherwise waits for it without prompting.
-    /// The UI asks for access when the user is ready.
     func start() {
         // A preview's buttons must not put a real tap in front of the keyboard.
         guard tap == nil, !AppEnvironment.isPreview else { return }
         if !tryStart() {
-            log("Waiting for \(neededPermission.displayName) access…")
+            log("Waiting for Accessibility access…")
             waitForPermission()
         }
     }
 
     // MARK: - Permissions
 
-    /// Gets HomeRower into the list in Privacy & Security so the user can turn it on.
-    func requestPermission() {
-        if neededPermission == .accessibility {
-            requestAccessibility()
-            return
-        }
-        // Input Monitoring: the first time, asking adds HomeRower to the list and macOS
-        // shows its own alert with a button that opens the list, so the list isn't opened
-        // here as well. macOS only shows that alert once, so after that this opens the list.
-        guard store.hasPrompted(for: neededPermission) else {
-            store.setHasPrompted(true, for: neededPermission)
-            _ = CGRequestListenEventAccess()
-            return
-        }
-        PrivacyAccess.openSettings(for: neededPermission)
-    }
-
-    /// Always asks macOS, because only asking adds HomeRower back to the list after its
-    /// entry was deleted (if the entry exists, asking does no harm). macOS sometimes answers
-    /// with its own alert, whose button opens the list; if it doesn't, the list is opened
-    /// here instead, so the user never gets the alert and the list at the same time.
-    private func requestAccessibility() {
-        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-        Task { [weak self] in
-            // The alert takes a moment to appear; look for it for up to a second.
-            for _ in 0..<7 {
-                try? await Task.sleep(for: .milliseconds(150))
-                if PrivacyAccess.isAccessibilityAlertShowing() {
-                    self?.log("macOS showed its Accessibility alert; letting it open System Settings")
-                    return
-                }
-            }
-            self?.log("No Accessibility alert from macOS; opening System Settings")
-            PrivacyAccess.openSettings(for: .accessibility)
-        }
-    }
-
-    /// Removes HomeRower from Privacy & Security and asks again. Fixes an entry that's
-    /// on but no longer matches the app, which happens after rebuilding with ad-hoc signing.
-    func resetPermission() async {
-        guard let bundleID = Bundle.main.bundleIdentifier, !isResettingPermission, !AppEnvironment.isPreview else { return }
-        isResettingPermission = true
-        defer { isResettingPermission = false }
-
-        for service in PrivacyAccess.tccServices {
-            let exitCode = await PrivacyAccess.resetEntry(service: service, bundleID: bundleID)
-            log("tccutil reset \(service): \(exitCode == 0 ? "ok" : "failed (\(exitCode))")")
-        }
-        // With the entries gone, macOS shows its alert again, so ask through it.
-        store.forgetPermissionPrompts()
-        neededPermission = .accessibility
-        isTapBlocked = false
-        blockedAttempts = 0
-        needsManualRetry = false
-        restartNotBefore = nil
-        consecutiveFailSafes = 0
-        requestPermission()
-    }
-
-    /// Tries to create the tap with the access that's on now, updating what's still needed.
-    /// Returns `true` once the tap is running.
     private func tryStart() -> Bool {
-        // Only try the tap once Accessibility is on. Trying earlier makes macOS ask for
-        // Input Monitoring, which HomeRower usually doesn't need.
-        guard AXIsProcessTrusted() else {
-            neededPermission = .accessibility
+        guard PrivacyAccess.isAccessibilityOn else {
             isTapBlocked = false
             blockedAttempts = 0
             // Access being off now means the user is turning it back on, so the next
@@ -517,9 +443,10 @@ final class EventTap {
         if createTap() { return true }
 
         blockedAttempts += 1
-        if !CGPreflightListenEventAccess() {
-            neededPermission = .inputMonitoring
-        } else if blockedAttempts >= 4 {
+        if blockedAttempts == 1 {
+            log("macOS refused the tap. \(diagnostics)")
+        }
+        if blockedAttempts >= 4 {
             isTapBlocked = true
         }
         return false
@@ -545,9 +472,7 @@ final class EventTap {
     /// HomeRower's entry is deleted, they can keep reporting access while macOS rejects
     /// its events. The echo check in `monitorTap()` covers that.
     private var hasRequiredAccess: Bool {
-        guard AXIsProcessTrusted() else { return false }
-        // Input Monitoring only matters if this Mac needed it to start the tap.
-        return neededPermission != .inputMonitoring || CGPreflightListenEventAccess()
+        PrivacyAccess.isAccessibilityOn
     }
 
     /// Permission and tap state in one line, for the log.
@@ -616,12 +541,6 @@ final class EventTap {
         let before = diagnostics
         teardownTap()
         log("Fail-safe stop (\(reason), detected by \(source)). Before: \(before)")
-
-        // The entry may have been removed, not just switched off. macOS only adds it back
-        // through its alert, so ask through the alert again next time.
-        if reason == .accessRevoked || reason == .postingBlocked {
-            store.forgetPermissionPrompts()
-        }
 
         // Plain access loss waits for access to come back. Anything else means the checks
         // said yes but the tap didn't work, so back off, and after a couple of tries stop
@@ -951,10 +870,8 @@ extension EventTap {
     static func preview(
         status: Status = .running,
         isEnabled: Bool = true,
-        neededPermission: Permission = .accessibility,
         needsManualRetry: Bool = false,
         isTapBlocked: Bool = false,
-        isResettingPermission: Bool = false,
         capsLockTarget: UInt16? = nil,
         capsLockModifiers: ModifierSet = [],
         logLines: [String] = []
@@ -962,10 +879,8 @@ extension EventTap {
         let eventTap = EventTap(store: .preview)
         eventTap.status = status
         eventTap.isEnabled = isEnabled
-        eventTap.neededPermission = neededPermission
         eventTap.needsManualRetry = needsManualRetry
         eventTap.isTapBlocked = isTapBlocked
-        eventTap.isResettingPermission = isResettingPermission
         eventTap.layout.capsLockTarget = capsLockTarget
         eventTap.layout.homeRowMods[KeyCode.capsLock] = capsLockModifiers.isEmpty ? nil : capsLockModifiers
         // Set last: the changes above add their own log lines.
