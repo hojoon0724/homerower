@@ -17,11 +17,13 @@ struct KeyCap: View {
     var hand: Hand?
     /// The key acts as another key (e.g. Caps Lock → Esc); `label` is that key.
     var isRemapped = false
+    /// The layer holding the key switches to, shown where modifiers would be.
+    var layer: Int?
     let isMappable: Bool
     var pressState = PressState.up
     let unit: CGFloat
 
-    private var isHighlighted: Bool { !modifiers.isEmpty || isRemapped }
+    private var isHighlighted: Bool { !modifiers.isEmpty || isRemapped || layer != nil }
 
     /// Outline and tint while the key is down: blue when pressed, red once it's a hold.
     private var pressColor: Color? {
@@ -45,7 +47,17 @@ struct KeyCap: View {
                 .padding(.horizontal, unit * 0.08)
                 .foregroundStyle(isRemapped ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(isMappable ? .primary : .tertiary))
             Spacer(minLength: 0)
-            if !modifiers.isEmpty {
+            if let layer {
+                HStack(spacing: unit * 0.04) {
+                    Image(systemName: "square.2.layers.3d.top.filled")
+                    Text("\(layer)")
+                }
+                .font(.system(size: unit * 0.24, weight: .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+                .foregroundStyle(Color.accentColor)
+                .padding(.bottom, unit * 0.06)
+            } else if !modifiers.isEmpty {
                 // Symbols on one line that never wraps; it shrinks to fit instead. A side
                 // label sits on the side it names: "LEFT ⇧" and "⇧ RIGHT".
                 HStack(alignment: .center, spacing: unit * 0.02) {
@@ -119,6 +131,8 @@ struct KeyCap: View {
             .frame(width: unit * 1.75, height: unit)
         KeyCap(label: "Left ⌃", isRemapped: true, isMappable: true, unit: unit)
             .frame(width: unit * 1.75, height: unit)
+        KeyCap(label: "-", layer: 1, isMappable: true, unit: unit)
+            .frame(width: unit, height: unit)
         KeyCap(label: "⇥", isMappable: false, unit: unit)
             .frame(width: unit * 1.5, height: unit)
     }

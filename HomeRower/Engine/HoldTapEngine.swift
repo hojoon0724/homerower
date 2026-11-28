@@ -12,15 +12,15 @@ nonisolated struct KeyEvent: Equatable, Sendable {
 nonisolated enum EngineAction: Equatable, Sendable {
     /// Let the current physical event through unchanged (apart from active modifier flags).
     case passThrough
-    /// Post a synthetic key event.
-    case key(UInt16, down: Bool, isRepeat: Bool = false)
+    /// Post a synthetic key event, with Shift added to it alone if `isShifted`.
+    case key(UInt16, down: Bool, isRepeat: Bool = false, isShifted: Bool = false)
     /// Press or release a synthetic modifier.
     case modifier(Modifier, down: Bool)
     /// Call `timerFired(token:at:)` after `delay` seconds.
     case startTimer(token: Int, delay: TimeInterval)
 }
 
-/// QMK-style hold-tap state machine for home-row mods.
+/// QMK-style hold-tap state machine for home-row mods and layer keys.
 ///
 /// Pure logic with no CoreGraphics dependency: feed it key events with timestamps
 /// and it returns the actions to perform.
@@ -35,11 +35,20 @@ nonisolated struct HoldTapEngine {
         /// same-hand letter, which the typing-speed and opposite-hand rules would turn
         /// into two letters.
         var shiftDecidedByRelease = Config.shiftDecidedByRelease
+        /// Physical key → number of the layer it switches on while held (1 and up).
+        var layerKeys: [UInt16: Int] = [:]
+        /// Remaps of each layer, Layer 1 first: physical key → key (and Shift) it acts as.
+        var layerRemaps: [[UInt16: KeyStroke]] = []
+        /// Physical key → key it acts as on Layer 0, for keys the system doesn't already
+        /// remap (including Caps Lock's stand-in → the key Caps Lock acts as).
+        var baseRemaps: [UInt16: KeyStroke] = [:]
     }
 
     private struct Pending {
         var keyCode: UInt16
+        /// What a hold does: hold these modifiers, or (when `layer` is set) switch to a layer.
         var modifiers: ModifierSet
+        var layer: Int?
         var downTime: TimeInterval
         var token: Int
         /// Pressed during fast typing (typing-speed rule): only a timeout can make it a hold.
@@ -59,6 +68,11 @@ nonisolated struct HoldTapEngine {
     private var buffer: [Buffered] = []
     /// Physical key → modifier it is currently holding down.
     private var heldModifiers: [UInt16: ModifierSet] = [:]
+    /// Layer keys held down with their layer on, oldest first. The newest one's layer is in use.
+    private var heldLayers: [(keyCode: UInt16, layer: Int)] = []
+    /// Physical key → key it was sent as when it went down, so its repeats and release
+    /// match even if the layer changes while it's down.
+    private var sentAs: [UInt16: KeyStroke] = [:]
     /// Time of the last live key event (typing-speed rule).
     private var lastEventTime: TimeInterval?
     private var nextToken = 0
@@ -71,8 +85,11 @@ nonisolated struct HoldTapEngine {
     /// Modifiers currently held by home-row keys.
     var activeModifiers: Set<Modifier> { Set(heldModifiers.values.flatMap(\.modifiers)) }
 
-    /// Home-row keys currently held as their modifier.
-    var heldKeys: Set<UInt16> { Set(heldModifiers.keys) }
+    /// Keys currently held as their modifier or layer.
+    var heldKeys: Set<UInt16> { Set(heldModifiers.keys).union(heldLayers.map(\.keyCode)) }
+
+    /// The layer in use: 0 for the base layer, otherwise the newest held layer key's.
+    var activeLayer: Int { heldLayers.last?.layer ?? 0 }
 
     // MARK: - Inputs
 
@@ -114,6 +131,8 @@ nonisolated struct HoldTapEngine {
         pending = nil
         buffer = []
         heldModifiers = [:]
+        heldLayers = []
+        sentAs = [:]
         lastEventTime = nil
         return releases
     }
@@ -136,14 +155,15 @@ nonisolated struct HoldTapEngine {
 
         if event.isDown {
             if event.isRepeat {
-                // Autorepeat of a key that is acting as a modifier: swallow.
-                if heldModifiers[event.keyCode] == nil { emit(event) }
+                // Autorepeat of a key that is acting as a modifier or layer: swallow.
+                if !isHeld(event.keyCode) { emit(event) }
                 return
             }
-            if let modifiers = settings.keyMap[event.keyCode], !modifiers.isEmpty, heldModifiers[event.keyCode] == nil {
+            if !isHeld(event.keyCode), let hold = holdAction(of: event.keyCode) {
                 startPending(
                     keyCode: event.keyCode,
-                    modifiers: modifiers,
+                    modifiers: hold.modifiers,
+                    layer: hold.layer,
                     downTime: event.timestamp,
                     isFastTyping: item.isFastTyping,
                     now: now
@@ -152,10 +172,7 @@ nonisolated struct HoldTapEngine {
             }
             emit(event)
         } else {
-            if let modifiers = heldModifiers.removeValue(forKey: event.keyCode) {
-                output += Self.release(modifiers)
-                return
-            }
+            if releaseHold(of: event.keyCode) { return }
             emit(event)
         }
     }
@@ -169,8 +186,8 @@ nonisolated struct HoldTapEngine {
             guard !event.isDown else { return }
             // Released before anything decided it → tap.
             self.pending = nil
-            output.append(.key(pending.keyCode, down: true))
-            output.append(.key(pending.keyCode, down: false))
+            emit(KeyEvent(keyCode: pending.keyCode, isDown: true, timestamp: event.timestamp))
+            emit(event)
             replayBuffer(now: now)
             return
         }
@@ -193,21 +210,23 @@ nonisolated struct HoldTapEngine {
             return
         }
 
-        // Shift, and keys outside the letter block (Caps Lock), aren't typed in rolls:
-        // only releases (and the timeout) decide, so skip the rules that decide on a key
-        // going down.
+        // Shift, layer keys, and keys outside the letter block (Caps Lock), aren't typed in
+        // rolls: only releases (and the timeout) decide, so skip the rules that decide on a
+        // key going down.
         let decidedByRelease = (settings.shiftDecidedByRelease && pending.modifiers.isShiftOnly)
+            || pending.layer != nil
             || Config.hand(of: pending.keyCode) == nil
 
         // Fast typing: the next key press means this was a letter in a roll. Only
-        // holding past the tapping term (the timeout) makes it a modifier.
-        if pending.isFastTyping && event.isDown && !decidedByRelease {
+        // holding past the tapping term (the timeout) makes it a modifier. A layer key is
+        // usually another character typed in passing, so this applies to it too.
+        if pending.isFastTyping && event.isDown && (!decidedByRelease || pending.layer != nil) {
             resolveTap(trigger: item, now: now)
             return
         }
 
         let sameHand = isSameHand(event.keyCode, pending.keyCode)
-        let isHomeRowMod = settings.keyMap[event.keyCode] != nil
+        let isHomeRowMod = isHomeRowMod(event.keyCode)
 
         if event.isDown {
             // Opposite-hand rule: a same-hand key means we're typing, not chording.
@@ -235,11 +254,10 @@ nonisolated struct HoldTapEngine {
     /// Handles a repeat or release of a key pressed before the pending key, as if nothing
     /// were pending: a held modifier is released, anything else goes straight out.
     private mutating func passEarlierKey(_ event: KeyEvent) {
-        if let modifiers = heldModifiers[event.keyCode] {
-            // Autorepeat of a key acting as a modifier is swallowed.
+        if isHeld(event.keyCode) {
+            // Autorepeat of a key acting as a modifier or layer is swallowed.
             guard !event.isDown else { return }
-            heldModifiers[event.keyCode] = nil
-            output += Self.release(modifiers)
+            releaseHold(of: event.keyCode)
             return
         }
         emit(event)
@@ -250,13 +268,21 @@ nonisolated struct HoldTapEngine {
     private mutating func startPending(
         keyCode: UInt16,
         modifiers: ModifierSet,
+        layer: Int?,
         downTime: TimeInterval,
         isFastTyping: Bool,
         now: TimeInterval
     ) {
         let token = nextToken
         nextToken += 1
-        pending = Pending(keyCode: keyCode, modifiers: modifiers, downTime: downTime, token: token, isFastTyping: isFastTyping)
+        pending = Pending(
+            keyCode: keyCode,
+            modifiers: modifiers,
+            layer: layer,
+            downTime: downTime,
+            token: token,
+            isFastTyping: isFastTyping
+        )
         let remaining = max(0, settings.tappingTerm - (now - downTime))
         output.append(.startTimer(token: token, delay: remaining))
     }
@@ -266,17 +292,22 @@ nonisolated struct HoldTapEngine {
     private mutating func resolveTap(trigger: Buffered, now: TimeInterval) {
         guard let pending else { return }
         self.pending = nil
-        output.append(.key(pending.keyCode, down: true))
+        emit(KeyEvent(keyCode: pending.keyCode, isDown: true, timestamp: now))
         buffer.append(trigger)
         replayBuffer(now: now)
     }
 
-    /// Resolves the pending key as a hold: its modifier stays down until the key goes up.
+    /// Resolves the pending key as a hold: its modifier (or layer) stays on until the key
+    /// goes up. Keys pressed while it was undecided are replayed in the new layer.
     private mutating func resolveHold(trigger: Buffered?, now: TimeInterval) {
         guard let pending else { return }
         self.pending = nil
-        heldModifiers[pending.keyCode] = pending.modifiers
-        output += pending.modifiers.modifiers.map { .modifier($0, down: true) }
+        if let layer = pending.layer {
+            heldLayers.append((pending.keyCode, layer))
+        } else {
+            heldModifiers[pending.keyCode] = pending.modifiers
+            output += pending.modifiers.modifiers.map { .modifier($0, down: true) }
+        }
         if let trigger { buffer.append(trigger) }
         replayBuffer(now: now)
     }
@@ -298,15 +329,77 @@ nonisolated struct HoldTapEngine {
         modifiers.modifiers.reversed().map { .modifier($0, down: false) }
     }
 
+    /// Sends a key as the key it acts as in the layer in use. A press decides that; its
+    /// repeats and release follow the press, whatever layer is in use by then.
     private mutating func emit(_ event: KeyEvent) {
-        output.append(.key(event.keyCode, down: event.isDown, isRepeat: event.isRepeat))
+        let stroke: KeyStroke
+        if event.isDown && !event.isRepeat {
+            stroke = outputKey(for: event.keyCode)
+            sentAs[event.keyCode] = stroke
+        } else if event.isDown {
+            stroke = sentAs[event.keyCode] ?? outputKey(for: event.keyCode)
+        } else {
+            stroke = sentAs.removeValue(forKey: event.keyCode) ?? outputKey(for: event.keyCode)
+        }
+        output.append(.key(stroke.keyCode, down: event.isDown, isRepeat: event.isRepeat, isShifted: stroke.isShifted))
+    }
+
+    /// The key a physical key acts as in the layer in use: its remap there, or else what it
+    /// is on Layer 0.
+    private func outputKey(for keyCode: UInt16) -> KeyStroke {
+        layerRemap(of: keyCode) ?? settings.baseRemaps[keyCode] ?? KeyStroke(keyCode)
+    }
+
+    /// The key the layer in use remaps a physical key to, if it does.
+    private func layerRemap(of keyCode: UInt16) -> KeyStroke? {
+        let index = activeLayer - 1
+        guard settings.layerRemaps.indices.contains(index) else { return nil }
+        return settings.layerRemaps[index][keyCode]
+    }
+
+    /// What holding a key does in the layer in use, or `nil` if it's a plain key there. A
+    /// layer that remaps a key makes it plain; otherwise it keeps its Layer 0 hold. Layer
+    /// keys only switch from Layer 0: once a layer is on, they just type, so holding a
+    /// second one never moves to another layer.
+    private func holdAction(of keyCode: UInt16) -> (modifiers: ModifierSet, layer: Int?)? {
+        guard layerRemap(of: keyCode) == nil else { return nil }
+        if let layer = settings.layerKeys[keyCode] {
+            return activeLayer == 0 ? ([], layer) : nil
+        }
+        if let modifiers = settings.keyMap[keyCode], !modifiers.isEmpty { return (modifiers, nil) }
+        return nil
+    }
+
+    /// Whether a key has hold modifiers in the layer in use.
+    private func isHomeRowMod(_ keyCode: UInt16) -> Bool {
+        holdAction(of: keyCode).map { $0.layer == nil } ?? false
+    }
+
+    /// Whether a key is down acting as its modifier or layer.
+    private func isHeld(_ keyCode: UInt16) -> Bool {
+        heldModifiers[keyCode] != nil || heldLayers.contains { $0.keyCode == keyCode }
+    }
+
+    /// Ends a key's hold when it goes up: releases its modifiers or turns its layer off.
+    /// Returns `false` if it wasn't held.
+    @discardableResult
+    private mutating func releaseHold(of keyCode: UInt16) -> Bool {
+        if let modifiers = heldModifiers.removeValue(forKey: keyCode) {
+            output += Self.release(modifiers)
+            return true
+        }
+        if let index = heldLayers.firstIndex(where: { $0.keyCode == keyCode }) {
+            heldLayers.remove(at: index)
+            return true
+        }
+        return false
     }
 
     /// Whether a home-row key buffered behind the pending one sits on the other hand from `keyCode`.
     private func chordHasModifier(oppositeTo keyCode: UInt16) -> Bool {
         buffer.contains {
             $0.event.isDown && !$0.event.isRepeat
-                && settings.keyMap[$0.event.keyCode] != nil
+                && isHomeRowMod($0.event.keyCode)
                 && !isSameHand($0.event.keyCode, keyCode)
         }
     }

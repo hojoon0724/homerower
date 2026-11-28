@@ -10,6 +10,16 @@ enum KeyNames {
         return "Key \(keyCode)"
     }
 
+    /// A key sent with or without Shift, e.g. "{" or "Shift-A".
+    static func name(for stroke: KeyStroke) -> String {
+        guard stroke.isShifted else { return name(for: stroke.keyCode) }
+        if let shifted = KeyLabels.character(for: stroke.keyCode, shifted: true), !shifted.isEmpty,
+           shifted.uppercased() != KeyLabels.character(for: stroke.keyCode)?.uppercased() {
+            return shifted
+        }
+        return "Shift-" + name(for: stroke.keyCode)
+    }
+
     private static let specialNames: [UInt16: String] = [
         36: "Return", 48: "Tab", 49: "Space", 51: "Delete", 53: "Esc", 57: "Caps Lock",
         117: "Fwd Delete", 115: "Home", 119: "End", 116: "Page Up", 121: "Page Down",
@@ -24,7 +34,8 @@ enum KeyNames {
 
 /// Looks up what a physical key types with the current keyboard input source.
 enum KeyLabels {
-    static func character(for keyCode: UInt16) -> String? {
+    /// What a key types, or with `shifted` what it types with Shift (e.g. { for [).
+    static func character(for keyCode: UInt16, shifted: Bool = false) -> String? {
         guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let layoutData = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else {
             return nil
@@ -40,7 +51,8 @@ enum KeyLabels {
                 layout,
                 keyCode,
                 UInt16(kUCKeyActionDisplay),
-                0,
+                // Modifier state in the form UCKeyTranslate wants: Carbon flags >> 8.
+                shifted ? UInt32(shiftKey >> 8) & 0xFF : 0,
                 UInt32(LMGetKbdType()),
                 OptionBits(kUCKeyTranslateNoDeadKeysBit),
                 &deadKeyState,

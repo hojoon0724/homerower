@@ -82,7 +82,7 @@ struct KeyTableTests {
 
     @Test func everyRowFillsTheKeyboardWidth() {
         for row in KeySpec.rows {
-            #expect(row.keys.reduce(0) { $0 + $1.width } == KeySpec.rowWidth, "row \(row.id)")
+            #expect(row.slots.reduce(0) { $0 + $1.width } == KeySpec.rowWidth, "row \(row.id)")
         }
     }
 

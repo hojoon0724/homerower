@@ -30,10 +30,10 @@ final class SettingsStoreTests {
     @Test func savesValues() {
         store.tappingTermMs = 250
         store.priorIdleMs = 0
-        let layer = Layer(name: "Nav", activationKey: KeyCode.space, remaps: [KeyCode.h: 123])
+        let layer = Layer(activationKeys: [KeyCode.space, KeyCode.g], remaps: [KeyCode.h: KeyStroke(123), KeyCode.j: KeyStroke(KeyCode.leftBracket, isShifted: true)])
         let layout = Layout(
             homeRowMods: [KeyCode.g: .leftCommand],
-            remaps: [KeyCode.capsLock: KeyCode.escape],
+            remaps: [KeyCode.capsLock: KeyStroke(KeyCode.escape)],
             layers: [layer]
         )
         store.layout = layout
@@ -58,7 +58,7 @@ final class SettingsStoreTests {
         defaults.set(Int(KeyCode.escape), forKey: "capsLockTarget")
         #expect(store.layout == Layout(
             homeRowMods: [KeyCode.a: .leftShift],
-            remaps: [KeyCode.capsLock: KeyCode.escape]
+            remaps: [KeyCode.capsLock: KeyStroke(KeyCode.escape)]
         ))
 
         // The first save replaces the old keys.
@@ -116,5 +116,14 @@ final class SettingsStoreTests {
         eventTap.select(.preset(.none))
         #expect(store.tappingTermMs == Config.tappingTerm * 1000)
         #expect(store.layout == .none)
+    }
+
+    @Test func layersSavedWithOneKeyOrArrowRemapsStillLoad() throws {
+        // An older layer: a single activation key, and a remap of an arrow key.
+        let json = #"{"homeRowMods": {}, "remaps": {}, "layers": [{"activationKey": 27, "remaps": {"4": 123, "126": 53}}]}"#
+        let layout = try JSONDecoder().decode(Layout.self, from: Data(json.utf8))
+        #expect(layout.layers.first?.activationKeys == [27])
+        // Arrows can't be remapped any more, so that one's dropped.
+        #expect(layout.layers.first?.remaps == [KeyCode.h: KeyStroke(123)])
     }
 }

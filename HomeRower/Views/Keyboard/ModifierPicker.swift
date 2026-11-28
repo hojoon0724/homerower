@@ -9,13 +9,23 @@ struct ModifierPicker: View {
     @Binding var selection: ModifierSet
     /// What the key does with nothing checked; defaults to "<key> always types."
     var nothingChecked: String?
+    /// Pads itself and fixes its width, as a popover's whole content; off inside a view
+    /// that does that already.
+    var isPadded = true
     @State private var showsOtherSide: Bool
 
-    init(keyLabel: String, hand: Hand?, selection: Binding<ModifierSet>, nothingChecked: String? = nil) {
+    init(
+        keyLabel: String,
+        hand: Hand?,
+        selection: Binding<ModifierSet>,
+        nothingChecked: String? = nil,
+        isPadded: Bool = true
+    ) {
         self.keyLabel = keyLabel
         self.hand = hand
         _selection = selection
         self.nothingChecked = nothingChecked
+        self.isPadded = isPadded
         // Hidden by default, but not when it holds something already checked.
         let otherSide = Self.modifiers(onLeft: hand != .left)
         _showsOtherSide = State(initialValue: otherSide.contains { selection.wrappedValue.contains($0) })
@@ -64,8 +74,8 @@ struct ModifierPicker: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .padding()
-        .frame(width: 200, alignment: .leading)
+        .padding(isPadded ? 16 : 0)
+        .frame(width: isPadded ? 200 : nil, alignment: .leading)
     }
 
     private func checkbox(_ modifier: Modifier, title: String) -> some View {

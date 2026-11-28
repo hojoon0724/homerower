@@ -28,6 +28,11 @@ import SwiftUI
     }
 }
 
+// Previews can't render scenes, so this shows the main window's content.
+#Preview("App") {
+    RootView(eventTap: .preview(), launchSettings: .preview())
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let eventTap = EventTap()
     let launchSettings = LaunchSettings()

@@ -10,14 +10,12 @@ struct MenuContentView: View {
 
         switch eventTap.status {
         case .running:
-            Text("Event tap running")
+            EmptyView()
         case .waitingForPermission:
-            Text("Waiting for permission")
             Button("Set Up Permission…") {
                 openWindow.bringToFront(.main)
             }
         case .stopped:
-            Text("Stopped")
             Button("Start") {
                 eventTap.start()
             }
@@ -42,25 +40,61 @@ struct MenuContentView: View {
     }
 }
 
-// The real menu is drawn by the menu bar; these lay its items out in a column.
+// The real menu is drawn by the menu bar, which previews can't show (and opening a
+// SwiftUI `Menu` crashes the preview). These styles make the items look like menu
+// items instead of a window's buttons and checkboxes.
+
+/// Width of the column on the left of a menu, where checkmarks go.
+private let checkmarkColumnWidth: CGFloat = 20
+
+private struct MenuItemButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+    }
+}
+
+private struct MenuItemToggleStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 3)
+            .overlay(alignment: .leading) {
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: checkmarkColumnWidth)
+                    .offset(x: -checkmarkColumnWidth)
+                    .opacity(configuration.isOn ? 1 : 0)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { configuration.isOn.toggle() }
+    }
+}
+
+private func menuPreview(_ eventTap: EventTap) -> some View {
+    VStack(alignment: .leading, spacing: 2) {
+        MenuContentView(eventTap: eventTap)
+    }
+    .buttonStyle(MenuItemButtonStyle())
+    .toggleStyle(MenuItemToggleStyle())
+    .padding(.leading, checkmarkColumnWidth + 8)
+    .padding(.trailing, 14)
+    .padding(.vertical, 6)
+    .frame(width: 240)
+    .background(.regularMaterial, in: .rect(cornerRadius: 10))
+    .padding()
+}
 
 #Preview("Running") {
-    VStack(alignment: .leading) {
-        MenuContentView(eventTap: .preview())
-    }
-    .padding()
+    menuPreview(.preview())
 }
 
 #Preview("Waiting for Permission") {
-    VStack(alignment: .leading) {
-        MenuContentView(eventTap: .preview(status: .waitingForPermission))
-    }
-    .padding()
+    menuPreview(.preview(status: .waitingForPermission))
 }
 
 #Preview("Stopped") {
-    VStack(alignment: .leading) {
-        MenuContentView(eventTap: .preview(status: .stopped))
-    }
-    .padding()
+    menuPreview(.preview(status: .stopped))
 }

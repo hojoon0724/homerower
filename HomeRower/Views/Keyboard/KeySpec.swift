@@ -6,6 +6,10 @@ struct KeySpec: Identifiable {
     /// Fixed legend for non-character keys; character keys are labeled from the input source.
     var legend: String?
     var width: CGFloat = 1
+    /// Drawn half height, like the arrow keys. On its own it sits at the bottom of its
+    /// slot (← and →); with `stacksOnNext` it sits on top of the next key (↑ over ↓).
+    var isHalfHeight = false
+    var stacksOnNext = false
 
     var id: UInt16 { keyCode }
 
@@ -15,6 +19,29 @@ struct KeySpec: Identifiable {
     struct Row: Identifiable {
         let id: Int
         let keys: [KeySpec]
+
+        /// The keys grouped into the slots they're drawn in, left to right: usually one
+        /// key each, but ↑ and ↓ share one.
+        var slots: [Slot] {
+            var slots: [Slot] = []
+            var stacked: [KeySpec] = []
+            for key in keys {
+                stacked.append(key)
+                if !key.stacksOnNext {
+                    slots.append(Slot(keys: stacked))
+                    stacked = []
+                }
+            }
+            return slots
+        }
+    }
+
+    /// One place in a row: a key, or keys stacked top to bottom.
+    struct Slot: Identifiable {
+        let keys: [KeySpec]
+
+        var id: UInt16 { keys.first?.keyCode ?? 0 }
+        var width: CGFloat { keys.first?.width ?? 0 }
     }
 
     /// Keys whose cap shows a symbol rather than a name (⌫, ⇥, ↩).
@@ -28,6 +55,17 @@ struct KeySpec: Identifiable {
             return legend
         }
         return KeyNames.name(for: keyCode)
+    }
+
+    /// How to show a key sent with or without Shift: what it types shifted where that's a
+    /// different character ({ for [), otherwise ⇧ and its name (⇧A, ⇧Space).
+    static func displayName(for stroke: KeyStroke) -> String {
+        guard stroke.isShifted else { return displayName(for: stroke.keyCode) }
+        if let shifted = KeyLabels.character(for: stroke.keyCode, shifted: true), !shifted.isEmpty,
+           shifted.uppercased() != KeyLabels.character(for: stroke.keyCode)?.uppercased() {
+            return shifted
+        }
+        return "⇧" + displayName(for: stroke.keyCode)
     }
 
     /// Width of every row, in key units.
@@ -53,9 +91,11 @@ struct KeySpec: Identifiable {
             KeySpec(keyCode: 49, legend: "", width: 5),
             KeySpec(keyCode: 54, legend: "⌘", width: 1.25),
             KeySpec(keyCode: 61, legend: "⌥"),
-            KeySpec(keyCode: 123, legend: "←"),
-            KeySpec(keyCode: 126, legend: "↑↓"),
-            KeySpec(keyCode: 124, legend: "→"),
+            // Arrows in an upside-down T, as on a MacBook Pro.
+            KeySpec(keyCode: 123, legend: "←", isHalfHeight: true),
+            KeySpec(keyCode: 126, legend: "↑", isHalfHeight: true, stacksOnNext: true),
+            KeySpec(keyCode: 125, legend: "↓", isHalfHeight: true),
+            KeySpec(keyCode: 124, legend: "→", isHalfHeight: true),
         ]),
     ]
 }

@@ -72,7 +72,7 @@ final class EventTap {
     private(set) var layout: Layout {
         didSet {
             store.layout = layout
-            engine.settings.keyMap = Self.engineKeyMap(for: layout)
+            Self.applyLayout(layout, to: &engine.settings)
         }
     }
 
@@ -178,24 +178,39 @@ final class EventTap {
         self.layoutSelection = selection
         engine.settings = HoldTapEngine.Settings(
             tappingTerm: tappingTermMs / 1000,
-            priorIdle: priorIdleMs / 1000,
-            keyMap: Self.engineKeyMap(for: layout)
+            priorIdle: priorIdleMs / 1000
         )
+        Self.applyLayout(layout, to: &engine.settings)
     }
 
-    /// The layout's hold modifiers as the engine sees keys: Caps Lock with hold modifiers
-    /// arrives as its stand-in key.
-    private static func engineKeyMap(for layout: Layout) -> [UInt16: ModifierSet] {
-        var keyMap = layout.homeRowMods
-        if let capsLock = keyMap.removeValue(forKey: KeyCode.capsLock) {
-            keyMap[Config.capsLockStandIn] = capsLock
+    /// Gives the engine a layout's hold modifiers, layer keys and layer remaps, by key as
+    /// the engine sees it: Caps Lock mapped to its stand-in arrives as that key.
+    private static func applyLayout(_ layout: Layout, to settings: inout HoldTapEngine.Settings) {
+        let capsLockIsStandIn = layout.capsLockSystemTarget == Config.capsLockStandIn
+        func engineKey(_ keyCode: UInt16) -> UInt16 {
+            keyCode == KeyCode.capsLock && capsLockIsStandIn ? Config.capsLockStandIn : keyCode
         }
-        return keyMap
+
+        settings.keyMap = Dictionary(uniqueKeysWithValues: layout.homeRowMods.map { (engineKey($0.key), $0.value) })
+        settings.layerKeys = [:]
+        for (index, layer) in layout.layers.enumerated() {
+            for key in layer.activationKeys { settings.layerKeys[engineKey(key)] = index + 1 }
+        }
+        settings.layerRemaps = layout.layers.map { layer in
+            Dictionary(uniqueKeysWithValues: layer.remaps.map { (engineKey($0.key), $0.value) })
+        }
+        // Caps Lock is remapped by the system, unless it's on its stand-in: then it still
+        // acts as its target on Layer 0.
+        settings.baseRemaps = layout.remaps.filter { $0.key != KeyCode.capsLock }
+        if capsLockIsStandIn, let target = layout.capsLockTarget {
+            settings.baseRemaps[Config.capsLockStandIn] = KeyStroke(target)
+        }
     }
 
-    /// The event is Caps Lock, remapped to its stand-in because it has hold modifiers.
+    /// The event is Caps Lock, which the system maps to its stand-in key while it has hold
+    /// modifiers or a layer remaps it.
     private func isCapsLockStandIn(_ keyCode: UInt16) -> Bool {
-        keyCode == Config.capsLockStandIn && !layout.capsLockModifiers.isEmpty
+        keyCode == Config.capsLockStandIn && layout.capsLockSystemTarget == Config.capsLockStandIn
     }
 
     func resetTimingsToDefaults() {
@@ -220,6 +235,39 @@ final class EventTap {
     @discardableResult
     func setCapsLockModifiers(_ modifiers: ModifierSet) -> Bool {
         edit(.capsLockModifiers(modifiers))
+    }
+
+    /// Adds a layer after the others. It starts empty, so every key passes through until
+    /// it's remapped. Returns the new layer's ID, or `nil` if there are already as many
+    /// layers as a layout can have.
+    @discardableResult
+    func addLayer() -> Layer.ID? {
+        guard layout.canAddLayer else { return nil }
+        let layer = Layer()
+        edit(.addLayer(layer))
+        return layer.id
+    }
+
+    /// Makes a key act as another key on Layer 0 instead of anything it does when held, or
+    /// type normally again with `nil`. Caps Lock goes through `setCapsLockTarget`.
+    func setRemap(_ target: KeyStroke?, for keyCode: UInt16) {
+        edit(.remap(target, keyCode: keyCode))
+    }
+
+    /// Makes holding a key switch to a layer instead of holding modifiers, or stop switching
+    /// with `nil`.
+    func setLayerKey(_ layerID: Layer.ID?, for keyCode: UInt16) {
+        edit(.layerKey(layerID, keyCode: keyCode))
+    }
+
+    /// Deletes a layer and its remaps; the layers after it move up a number.
+    func deleteLayer(id: Layer.ID) {
+        edit(.deleteLayer(id))
+    }
+
+    /// Makes a key act as another key while a layer is on, or pass through with `nil`.
+    func setRemap(_ target: KeyStroke?, for keyCode: UInt16, inLayer layerID: Layer.ID) {
+        edit(.layerRemap(target, keyCode: keyCode, layerID: layerID))
     }
 
     /// The name of a Layout menu entry.
@@ -747,10 +795,13 @@ final class EventTap {
             notePhysicalKey(isCapsLock ? KeyCode.capsLock : keyCode, isDown: type == .keyDown)
         }
 
-        // Apps must never see the stand-in key. While the engine is off, Caps Lock is
-        // plain Caps Lock: a press toggles it.
+        // Apps must never see the stand-in key. While the engine is off, Caps Lock does
+        // what it does on Layer 0 without hold modifiers: act as its target, or toggle.
         if isCapsLock, !isEnabled || isRecordingKey {
-            if type == .keyDown, event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+            let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            if let target = layout.capsLockTarget {
+                emitter.postKey(target, down: type == .keyDown, isRepeat: isRepeat)
+            } else if type == .keyDown, !isRepeat {
                 CapsLockRemap.toggleCapsLock()
             }
             return nil
@@ -777,7 +828,12 @@ final class EventTap {
         }
 
         let actions = engine.handle(keyEvent)
-        if perform(actions), !isCapsLock {
+        if perform(actions) {
+            // The stand-in passed through as itself is a plain Caps Lock press.
+            if isCapsLock {
+                if keyEvent.isDown && !keyEvent.isRepeat { CapsLockRemap.toggleCapsLock() }
+                return nil
+            }
             emitter.applyFlags(to: event)
             return Unmanaged.passUnretained(event)
         }
@@ -796,11 +852,11 @@ final class EventTap {
             switch action {
             case .passThrough:
                 passThrough = true
-            case let .key(keyCode, down, isRepeat) where isCapsLockStandIn(keyCode):
+            case let .key(keyCode, down, isRepeat, _) where isCapsLockStandIn(keyCode):
                 // Caps Lock was tapped, not held: toggle it, as the key normally would.
                 if down && !isRepeat { CapsLockRemap.toggleCapsLock() }
-            case let .key(keyCode, down, isRepeat):
-                emitter.postKey(keyCode, down: down, isRepeat: isRepeat)
+            case let .key(keyCode, down, isRepeat, isShifted):
+                emitter.postKey(keyCode, down: down, isRepeat: isRepeat, isShifted: isShifted)
             case let .modifier(modifier, down):
                 emitter.setModifier(modifier, down: down)
                 if logsKeyEvents { log("\(down ? "Hold" : "Release") \(modifier.rawValue)", isKeyEvent: true) }
@@ -827,7 +883,7 @@ final class EventTap {
 
     private func updateHeldKeys() {
         var held = engine.heldKeys
-        if held.remove(Config.capsLockStandIn) != nil, !layout.capsLockModifiers.isEmpty {
+        if held.remove(Config.capsLockStandIn) != nil, layout.capsLockSystemTarget == Config.capsLockStandIn {
             held.insert(KeyCode.capsLock)
         }
         if held != heldKeys { heldKeys = held }

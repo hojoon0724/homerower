@@ -40,9 +40,12 @@ final class Emitter {
         event.flags = event.flags.union(syntheticFlags)
     }
 
-    func postKey(_ keyCode: UInt16, down: Bool, isRepeat: Bool) {
+    /// Posts a key. `isShifted` adds Shift to this event alone (e.g. [ typed as {), without
+    /// holding Shift for anything typed around it.
+    func postKey(_ keyCode: UInt16, down: Bool, isRepeat: Bool, isShifted: Bool = false) {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(keyCode), keyDown: down) else { return }
         event.flags = hardwareFlags.union(syntheticFlags)
+        if isShifted { event.flags.formUnion(Modifier.leftShift.flags) }
         if isRepeat {
             event.setIntegerValueField(.keyboardEventAutorepeat, value: 1)
         }
